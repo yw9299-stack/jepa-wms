@@ -293,6 +293,7 @@ class VideoWM(nn.Module):
         proprio_features,
         ctxt_window=None,
         debug=False,
+        predictor_override=None,
     ):
         """
         Forward pass through the predictor.
@@ -307,6 +308,7 @@ class VideoWM(nn.Module):
             pred_action_features: (B, T, 1, D) or (B, T, H*W, D) depending on conditioning
             pred_proprio_features: (B, T, 1, D) or (B, T, H*W, D) depending on encoding
         """
+        predictor = self.predictor if predictor_override is None else predictor_override
         B, tau, V, H, W, D = video_features.shape  # N = p**2 * num_frames / tubelet_size_enc
         if self.action_encoder_inpred:
             B, T, A = action_features.shape
@@ -318,7 +320,7 @@ class VideoWM(nn.Module):
             )
             features = self.concat_obs_act(video_features, action_features, proprio_features)
             features = rearrange(features, "b t p d -> b (t p) d")
-            pred_features = self.predictor(features)
+            pred_features = predictor(features)
             pred_features = rearrange(pred_features, "b (t p) d -> b t p d", t=T)
             pred_video_features, pred_action_features = (
                 pred_features[:, :, :, : -action_features.shape[-1]],
@@ -335,7 +337,7 @@ class VideoWM(nn.Module):
                 pred_video_features, "b t (v h w) d -> b t v h w d", h=self.grid_size, w=self.grid_size
             )
         elif self.pred_type == "vjepa2_ac":
-            pred_video_features, pred_action_features, pred_proprio_features = self.predictor(
+            pred_video_features, pred_action_features, pred_proprio_features = predictor(
                 video_features.flatten(1, 4),  # (b, tau * v * h * w, d)
                 action_features,
                 proprio_features if proprio_features is not None else None,
@@ -344,7 +346,7 @@ class VideoWM(nn.Module):
                 pred_video_features, "b (t v h w) d -> b t v h w d", h=self.grid_size, w=self.grid_size, v=1
             )
         elif self.pred_type == "AdaLN":
-            pred_video_features, pred_action_features, pred_proprio_features = self.predictor(
+            pred_video_features, pred_action_features, pred_proprio_features = predictor(
                 video_features,
                 action_features,
                 proprio_features,

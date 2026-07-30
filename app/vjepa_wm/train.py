@@ -29,8 +29,14 @@ import torch.multiprocessing as mp
 import wandb
 from einops import rearrange
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+from app.plan_common.datasets.planner_landscape_h5 import (
+    PlannerLandscapeH5Dataset,
+    split_planner_groups_by_physical_episode,
+)
 from app.plan_common.datasets.preprocessor import Preprocessor
 from app.plan_common.datasets.transforms import make_inverse_transforms, make_transforms
 from app.plan_common.datasets.utils import init_data
@@ -38,6 +44,11 @@ from app.plan_common.models.wm_heads import (
     WorldModelPoseReadoutHead,
     WorldModelRewardReadoutHead,
     WorldModelViTImageHead,
+)
+from app.vjepa_wm.planner_landscape import (
+    install_planner_scale_gradient,
+    planner_input_scale,
+    planner_landscape_result,
 )
 from app.vjepa_wm.utils import (
     build_plan_eval_args,
@@ -92,6 +103,7 @@ def main(args, resume_preempt=False):
     plan_only_eval_mode = cfgs_meta.get("plan_only_eval_mode", False)
     unroll_decode_eval_only_mode = cfgs_meta.get("unroll_decode_eval_only_mode", False)
     light_eval_only_mode = cfgs_meta.get("light_eval_only_mode", False)
+    skip_planning_eval = cfgs_meta.get("skip_planning_eval", False)
 
     # -- LIGHT EVALS (keep as subconfigs, extract only frequently-checked flags)
     cfgs_data_traj_rollout_eval = cfgs_meta.get("data_traj_rollout_eval", {})
@@ -165,14 +177,18 @@ def main(args, resume_preempt=False):
     cfgs_custom = cfgs_data.get("custom", {})
     cfgs_droid = cfgs_data.get("droid", {})
 
-    # Compute dataset paths
+    # Compute dataset paths. ``paths`` is the explicit local-file path used by
+    # reproducible StableWorldModel HDF5 training and bypasses registry lookup.
     datasets = cfgs_data.get("datasets", [])
+    explicit_dataset_paths = cfgs_data.get("paths", None)
     datasets_weights = cfgs_data.get("datasets_weights", None)
     if datasets_weights is not None:
         assert len(datasets_weights) == len(datasets), "Must have one sampling weight specified for each dataset"
 
     dataset_type = cfgs_data.get("dataset_type", "custom")
-    if dataset_type.lower() == "mixed_dataset":
+    if explicit_dataset_paths is not None:
+        dataset_paths = list(explicit_dataset_paths)
+    elif dataset_type.lower() == "mixed_dataset":
         dataset_paths = datasets
     else:
         dataset_paths = get_dataset_paths(datasets)
@@ -204,11 +220,14 @@ def main(args, resume_preempt=False):
     # -- OPTIMIZATION (simplify main_optimizer logic)
     cfgs_opt = args.get("optimization")
     train_heads = cfgs_opt["train_heads"]
+    cfgs_planner_identified = args.get("planner_identified", {})
+    planner_identified_enabled = bool(cfgs_planner_identified.get("enabled", False))
 
     main_optimizer = cfgs_opt["main_optimizer"]
     if main_optimizer == "transition_model":
         num_epochs = cfgs_opt["transition_model"]["num_epochs"]
         ipe = cfgs_opt["transition_model"]["iterations_per_epoch"]
+        gradient_accumulation_steps = int(cfgs_opt["transition_model"].get("gradient_accumulation_steps", 1))
         train_predictor = True
         train_heads_on_predictor = False
     else:  # image_head | state_head | reward_head
@@ -216,6 +235,11 @@ def main(args, resume_preempt=False):
         ipe = cfgs_opt["heads"][main_optimizer]["iterations_per_epoch"]
         train_predictor = cfgs_opt["heads"]["train_predictor"]
         train_heads_on_predictor = cfgs_opt["heads"]["train_heads_on_predictor"]
+        gradient_accumulation_steps = 1
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if planner_identified_enabled and (main_optimizer != "transition_model" or train_heads):
+        raise ValueError("planner-identified training requires transition_model as the sole optimizer")
 
     # -- LOGGING
     cfgs_logging = args.get("logging")
@@ -318,6 +342,7 @@ def main(args, resume_preempt=False):
     # Prepare data kwargs from config, flattening nested structures and filtering out non-init_data fields
     excluded_keys = [
         "datasets",
+        "paths",
         "val_datasets",
         "img_size",
         # subfields of cfgs_data
@@ -381,7 +406,7 @@ def main(args, resume_preempt=False):
             **data_kwargs_1
         )
         val_data_iters.append((val_dataset_1, val_traj_dataset_1, val_unsupervised_loader_1))
-    if dataset_type == "custom" and traj_dataset is not None:
+    if dataset_type in {"custom", "stablewm_h5"} and traj_dataset is not None:
         preprocessor = Preprocessor(
             action_mean=traj_dataset.action_mean,
             action_std=traj_dataset.action_std,
@@ -398,13 +423,89 @@ def main(args, resume_preempt=False):
     _dlen = len(unsupervised_loader)
     if ipe is None:
         ipe = _dlen
+    if planner_identified_enabled and ipe != _dlen:
+        raise ValueError(
+            "planner-identified canonical passes require iterations_per_epoch=null "
+            f"(loader={_dlen}, configured={ipe})"
+        )
+    optimizer_steps_per_epoch = int(ipe) // gradient_accumulation_steps
+    if optimizer_steps_per_epoch < 1:
+        raise ValueError("not enough microbatches for one optimizer step")
+    microbatches_per_epoch = optimizer_steps_per_epoch * gradient_accumulation_steps
+    dropped_microbatches = int(ipe) - microbatches_per_epoch
+    ipe = microbatches_per_epoch
+    logger.info(
+        "Training schedule: "
+        f"loader_microbatches={_dlen}, used_microbatches={ipe}, "
+        f"gradient_accumulation={gradient_accumulation_steps}, "
+        f"optimizer_steps_per_epoch={optimizer_steps_per_epoch}, "
+        f"dropped_tail_microbatches={dropped_microbatches}"
+    )
     logger.info(f"📊 Iterations per epoch: {ipe} (dataset size: {_dlen})")
     if main_optimizer == "transition_model":
-        cfgs_opt["transition_model"]["iterations_per_epoch"] = ipe
+        cfgs_opt["transition_model"]["iterations_per_epoch"] = optimizer_steps_per_epoch
     elif main_optimizer == "image_head":
         cfgs_opt["heads"]["image_head"]["iterations_per_epoch"] = ipe
     elif main_optimizer == "state_head":
         cfgs_opt["heads"]["state_head"]["iterations_per_epoch"] = ipe
+
+    planner_loader = None
+    planner_sampler = None
+    planner_validation_groups = None
+    if planner_identified_enabled:
+        if dataset_type != "stablewm_h5":
+            raise ValueError("planner-identified cross-model training requires dataset_type=stablewm_h5")
+        if len(dataset_paths) != 1:
+            raise ValueError("planner-identified training requires one source HDF5")
+        sidecar_h5 = cfgs_planner_identified.get("sidecar_h5")
+        if not sidecar_h5:
+            raise ValueError("planner_identified.sidecar_h5 is required")
+        planner_dataset = PlannerLandscapeH5Dataset(
+            source_h5=dataset_paths[0],
+            sidecar_h5=sidecar_h5,
+            transform=transform,
+            action_mean=traj_dataset.action_mean,
+            action_std=traj_dataset.action_std,
+            proprio_mean=traj_dataset.proprio_mean,
+            proprio_std=traj_dataset.proprio_std,
+            expected_protocol=cfgs_planner_identified.get("expected_protocol", "pointmaze_planner_counterfactual_v1"),
+            frameskip=frameskip,
+            goal_offset_steps=cfgs_planner_identified.get("goal_offset_steps", 25),
+        )
+        planner_training_groups, planner_validation_groups = split_planner_groups_by_physical_episode(
+            planner_dataset,
+            traj_dataset.train_episode_ids,
+        )
+        planner_sampler = DistributedSampler(
+            planner_training_groups,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+            drop_last=False,
+        )
+        planner_num_workers = int(cfgs_planner_identified.get("num_workers", 4))
+        planner_loader_kwargs = {
+            "dataset": planner_training_groups,
+            "batch_size": int(cfgs_planner_identified.get("groups_per_batch", 16)),
+            "sampler": planner_sampler,
+            "drop_last": True,
+            "pin_memory": bool(cfgs_planner_identified.get("pin_memory", True)),
+            "num_workers": planner_num_workers,
+            "persistent_workers": planner_num_workers > 0
+            and bool(cfgs_planner_identified.get("persistent_workers", False)),
+        }
+        if planner_num_workers > 0:
+            planner_loader_kwargs["prefetch_factor"] = int(cfgs_planner_identified.get("prefetch_factor", 2))
+        planner_loader = DataLoader(**planner_loader_kwargs)
+        if len(planner_loader) < 1:
+            raise ValueError("planner landscape loader has no complete group batch")
+        logger.info(
+            "Planner landscape split: "
+            f"train_groups={len(planner_training_groups)}, "
+            f"validation_groups={len(planner_validation_groups)}, "
+            f"group_batches={len(planner_loader)}"
+        )
 
     # Logger
     class Trainer:
@@ -618,7 +719,7 @@ def main(args, resume_preempt=False):
         # Only resume the schedulers if we resume a pretraining or a finetuning
         # Not if we start a finetuning: we reset them
         if load_opt_scale_epoch and scheduler is not None and wd_scheduler is not None:
-            for _ in range(start_epoch * ipe):
+            for _ in range(start_epoch * optimizer_steps_per_epoch):
                 scheduler.step()
                 wd_scheduler.step()
         if light_eval_only_mode:
@@ -647,7 +748,11 @@ def main(args, resume_preempt=False):
             action_encoder = DDP(action_encoder, static_graph=False, find_unused_parameters=False)
         if proprio_encoder is not None:
             proprio_encoder = DDP(proprio_encoder, static_graph=False, find_unused_parameters=False)
-        predictor = DDP(predictor, static_graph=False, find_unused_parameters=False)
+        predictor = DDP(
+            predictor,
+            static_graph=False,
+            find_unused_parameters=planner_identified_enabled,
+        )
     for name in heads.keys():
         heads[name].model = DDP(heads[name].model, static_graph=False, find_unused_parameters=False)
 
@@ -677,8 +782,8 @@ def main(args, resume_preempt=False):
         "proprio_encoder_inpred": cfgs_model["proprio_encoder"].get("proprio_encoder_inpred", False),
         **cfgs_wm_encoding,
         # From cfgs_data
-        "action_skip": cfgs_data.get("action_skip", 1),
-        "frameskip": cfgs_data.get("frameskip", 1),
+        "action_skip": action_skip,
+        "frameskip": frameskip,
         "img_size": cfgs_data.get("img_size", 256),
         # Heads
         "heads": heads,
@@ -692,6 +797,26 @@ def main(args, resume_preempt=False):
         "cfgs_loss": cfgs_loss,
     }
     world_model = VideoWM(**wm_kwargs)
+    if planner_identified_enabled:
+        scale_module = planner_input_scale(world_model)
+        logger.info(
+            "Planner-identified input scale enabled: "
+            f"scale={scale_module.input_scale.detach().item():.6f}; "
+            "ordinary transition loss owns encoder/action/proprio/predictor, "
+            "planner landscape owns log_input_scale only"
+        )
+        zero = torch.zeros((), device=device)
+        planner_last_stats = {
+            "planner_landscape_loss": zero,
+            "planner_pairwise_sign_accuracy": zero,
+            "planner_predicted_cost_std": zero,
+            "planner_real_cost_std": zero,
+            "planner_scale": scale_module.input_scale.detach(),
+            "planner_log_scale": scale_module.log_scale.detach(),
+            "planner_scale_gradient": zero,
+        }
+    else:
+        planner_last_stats = {}
 
     # -- Initialize LPIPS once for evaluation
     lpips = lpips_lib.LPIPS(net="vgg").eval().to(device)
@@ -704,6 +829,9 @@ def main(args, resume_preempt=False):
             "opt": optimizer.state_dict() if optimizer is not None else None,
             "scaler": None if scaler is None else scaler.state_dict(),
             "epoch": epoch,
+            "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "planner_identified": (dict(cfgs_planner_identified) if planner_identified_enabled else None),
         }
         if world_model.action_encoder is not None and not cfgs_model["action_encoder"].get(
             "action_encoder_inpred", False
@@ -726,6 +854,7 @@ def main(args, resume_preempt=False):
 
     logger.info("Initializing loader...")
     train_loader = iter(unsupervised_loader)
+    planner_loader_iter = iter(planner_loader) if planner_loader is not None else None
     if val_data_iters != [(None, None, None)]:
         val_loader_iters = []
         for vl_dset, vl_traj_dset, vl_loader in val_data_iters:
@@ -740,7 +869,7 @@ def main(args, resume_preempt=False):
 
     def get_batch(train=True, idx=0):
         nonlocal train_loader, val_loader_iters
-        if dataset_type == "custom":
+        if dataset_type in {"custom", "stablewm_h5"}:
             try:
                 if train:
                     obs, action, state, reward = next(train_loader)
@@ -780,12 +909,22 @@ def main(args, resume_preempt=False):
             all_clips = {"visual": all_clips}
             return all_clips, None, None, None, all_masks_enc, all_masks_pred
 
+    def get_planner_batch():
+        nonlocal planner_loader_iter
+        if planner_loader is None:
+            raise RuntimeError("planner loader requested while PI-LTC is disabled")
+        try:
+            return next(planner_loader_iter)
+        except StopIteration:
+            planner_loader_iter = iter(planner_loader)
+            return next(planner_loader_iter)
+
     def get_viz_batch():
         """Get a visualization batch from the non-distributed validation loader (rank 0 only)"""
         nonlocal viz_val_loader_iter
         if rank != 0 or viz_val_loader_iter is None:
             return None, None, None, None, None, None
-        if dataset_type == "custom":
+        if dataset_type in {"custom", "stablewm_h5"}:
             try:
                 obs, action, state, reward = next(viz_val_loader_iter)
             except StopIteration as e:
@@ -820,6 +959,12 @@ def main(args, resume_preempt=False):
 
             # -- update distributed-data-loader epoch
             unsupervised_sampler.set_epoch(epoch)
+            # Recreate the iterator so the deliberately dropped tail never
+            # leaks into the next physical pass.
+            train_loader = iter(unsupervised_loader)
+            if planner_sampler is not None:
+                planner_sampler.set_epoch(epoch)
+                planner_loader_iter = iter(planner_loader)
 
             loss_meter = AverageMeter()
             gpu_time_meter = AverageMeter()
@@ -832,11 +977,19 @@ def main(args, resume_preempt=False):
                         break
 
                 def step_model(obs, action, state, reward, train=True):
+                    optimizer_boundary = train and (itr + 1) % gradient_accumulation_steps == 0
                     rates = defaultdict(float)
+                    rates["info/transition_model/optimizer_step"] = (
+                        epoch * optimizer_steps_per_epoch + (itr + 1) // gradient_accumulation_steps
+                    )
+                    rates["info/transition_model/microbatch_step"] = epoch * ipe + itr + 1
                     if train:
-                        if train_predictor:
+                        if train_predictor and optimizer_boundary:
                             rates["info/transition_model/lr"] = scheduler.step()
                             rates["info/transition_model/wd"] = wd_scheduler.step()
+                        elif train_predictor:
+                            rates["info/transition_model/lr"] = optimizer.param_groups[0]["lr"]
+                            rates["info/transition_model/wd"] = optimizer.param_groups[0]["weight_decay"]
                         if train_heads:
                             for name, head in world_model.heads.items():
                                 rates[f"info/{name}/lr"] = head.scheduler.step()
@@ -1056,6 +1209,7 @@ def main(args, resume_preempt=False):
                                         ].item()
                     total_stats.update(train_rollout_result)
                     total_stats.update(parallel_rollout_result)
+                    total_stats.update(planner_last_stats)
 
                     # Construct a clean losses dict that aggregates all relevant training losses
                     losses = {}
@@ -1068,6 +1222,8 @@ def main(args, resume_preempt=False):
                         total_head_loss.item() if isinstance(total_head_loss, torch.Tensor) else total_head_loss
                     )
                     losses["loss"] = losses["predictor_loss"] + losses["head_loss"]
+                    if planner_identified_enabled:
+                        losses["planner_landscape_loss"] = planner_last_stats["planner_landscape_loss"]
 
                     grad_stats, optim_stats = {}, {}
                     # 5. OPTIMIZATION STEP
@@ -1079,10 +1235,27 @@ def main(args, resume_preempt=False):
                                 # If not train_heads, world_model.heads[name].model.module.decoder_embed.weight.grad should be None
                                 grad_stats[name], optim_stats[name] = world_model.heads[name].optimization_step()
                         if train_predictor:
-                            world_model.backward(total_transition_loss)
-                            grad_stats["transition_model"], optim_stats["transition_model"] = (
-                                world_model.optimization_step()
-                            )
+                            world_model.backward(total_transition_loss / gradient_accumulation_steps)
+                            if optimizer_boundary:
+                                if planner_identified_enabled:
+                                    planner_result = planner_landscape_result(
+                                        world_model,
+                                        get_planner_batch(),
+                                        device=device,
+                                        dtype=dtype,
+                                        mixed_precision=mixed_precision,
+                                    )
+                                    planner_last_stats.update(planner_result.stats)
+                                    total_stats.update(planner_last_stats)
+                                    losses["planner_landscape_loss"] = planner_result.loss
+                                    install_planner_scale_gradient(
+                                        world_model,
+                                        planner_result.scale_gradient,
+                                    )
+                                (
+                                    grad_stats["transition_model"],
+                                    optim_stats["transition_model"],
+                                ) = world_model.optimization_step()
                         for key in list(grad_stats.keys()):
                             grad_stats[f"optim/{key}/grad_norm"] = (
                                 grad_stats[key].global_norm if grad_stats[key] is not None else 0.0
@@ -1431,7 +1604,7 @@ def main(args, resume_preempt=False):
                             save_checkpoint(epoch + 1, save_every_path)
 
             # -- Launch Planning Eval
-            if not light_eval_only_mode:
+            if not light_eval_only_mode and not skip_planning_eval:
                 if (epoch % eval_freq == 0) or epoch == (num_epochs - 1):
                     if save_every_freq > 0:
                         checkpoint = (

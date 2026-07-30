@@ -19,6 +19,7 @@ from .metaworld_hf_dset import load_metaworld_hf_slice_train_val
 from .point_maze_dset import load_point_maze_slice_train_val
 from .pusht_dset import load_pusht_slice_train_val
 from .robocasa_dset import load_robocasa_slice_train_val
+from .stablewm_h5_dset import load_stablewm_h5_train_val
 from .wall_dset import load_wall_slice_train_val
 
 # ----------------
@@ -87,7 +88,70 @@ def init_data(
 ) -> tuple[Callable]:
     logger.info(f"📂 Data paths: {data_paths}")
     shuffle = True
-    if dataset_type == "custom":
+    if dataset_type == "stablewm_h5":
+        if len(data_paths) != 1:
+            raise ValueError("stablewm_h5 requires exactly one source HDF5")
+        datasets, traj_dsets, train_episode_ids = load_stablewm_h5_train_val(
+            data_paths[0],
+            transform=transform,
+            normalize_action=normalize_action,
+            split_ratio=split_ratio,
+            num_hist=num_hist,
+            num_pred=num_pred,
+            num_frames_val=num_frames_val,
+            frameskip=frameskip,
+            action_skip=action_skip,
+            random_seed=seed,
+        )
+        dataset = datasets["train"]
+        # DistributedSampler.set_epoch() supplies a new deterministic ordering
+        # for every physical dataset pass.
+        shuffle = True
+        # Used to split planner groups without physical-episode leakage.
+        traj_dsets["train"].train_episode_ids = train_episode_ids
+        dist_sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+        )
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            collate_fn=collator,
+            sampler=dist_sampler,
+            batch_size=batch_size,
+            drop_last=drop_last,
+            pin_memory=pin_mem,
+            num_workers=num_workers,
+            persistent_workers=(num_workers > 0) and persistent_workers,
+        )
+        val_dist_sampler = torch.utils.data.distributed.DistributedSampler(
+            datasets["valid"],
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+        val_data_loader = torch.utils.data.DataLoader(
+            datasets["valid"],
+            collate_fn=collator,
+            sampler=val_dist_sampler,
+            batch_size=val_dataset_batch_size,
+            drop_last=val_dataset_drop_last,
+            pin_memory=pin_mem,
+            num_workers=num_workers,
+            persistent_workers=(num_workers > 0) and persistent_workers,
+        )
+        return (
+            dataset,
+            datasets["valid"],
+            traj_dsets["train"],
+            traj_dsets["valid"],
+            data_loader,
+            val_data_loader,
+            dist_sampler,
+            None,
+        )
+    elif dataset_type == "custom":
         if all("droid" in p for p in data_paths) or all("franka_custom" in p for p in data_paths):
             # We never pass the normalize_action argument to DROIDVideoDataset
             dataset = DROIDVideoDataset(
