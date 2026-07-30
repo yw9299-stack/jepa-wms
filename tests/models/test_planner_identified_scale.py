@@ -6,6 +6,7 @@
 #
 
 import unittest
+from contextlib import nullcontext
 
 import torch
 from torch.func import functional_call, jvp
@@ -13,6 +14,14 @@ from torch.func import functional_call, jvp
 from app.plan_common.models.AdaLN_vit import VisionTransformerAdaLN
 from app.plan_common.models.planner_identified_scale import PlannerIdentifiedInputScale
 from app.plan_common.models.vit import ViTPredictor
+
+
+def _math_sdpa():
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except ImportError:
+        return nullcontext()
+    return sdpa_kernel(SDPBackend.MATH)
 
 
 def _directional_jvp(model, args):
@@ -28,11 +37,15 @@ def _directional_jvp(model, args):
             output = output[0]
         return output
 
-    output, derivative = jvp(
-        forward_with_log_scale,
-        (log_scale,),
-        (torch.ones_like(log_scale),),
-    )
+    # Flash/efficient SDPA does not implement forward-mode AD on every
+    # backend (notably CPU). The math kernel is equivalent for this test and
+    # supports the JVP used by the mechanism preflight.
+    with _math_sdpa():
+        output, derivative = jvp(
+            forward_with_log_scale,
+            (log_scale,),
+            (torch.ones_like(log_scale),),
+        )
     output = output.flatten(1)
     derivative = derivative.flatten(1)
     projection = (derivative * output).sum(dim=1, keepdim=True)

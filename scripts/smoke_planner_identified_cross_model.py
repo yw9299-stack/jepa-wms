@@ -106,9 +106,10 @@ def _visual_output(output):
 
 
 def _math_sdpa():
-    if not torch.cuda.is_available():
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except ImportError:
         return nullcontext()
-    from torch.nn.attention import SDPBackend, sdpa_kernel
 
     return sdpa_kernel(SDPBackend.MATH)
 
