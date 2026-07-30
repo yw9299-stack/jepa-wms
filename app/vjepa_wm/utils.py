@@ -587,6 +587,7 @@ def init_video_model(
     cfgs_attn_pattern=None,
     use_activation_checkpointing=False,
     init_scale_factor_adaln=10,
+    planner_identified_input_scale=False,
     # Action configuration
     action_dim=7,
     action_conditioning="token",
@@ -713,6 +714,12 @@ def init_video_model(
         assert action_encoder_inpred == False
         assert proprio_encoder_inpred == False
         assert action_conditioning == "feature" and proprio_encoding == "feature"
+        if planner_identified_input_scale and embed_dim != pred_embed_dim:
+            raise ValueError(
+                "DINO-WM planner-identified scaling requires visual encoder and "
+                f"predictor dimensions to match, got embed_dim={embed_dim} and "
+                f"pred_embed_dim={pred_embed_dim}"
+            )
         logger.info(f"Using DINO WM predictor with num_patches {int(img_size / encoder.patch_size) ** 2}")
         concat_dim = 1
         predictor = ViTPredictor(
@@ -724,6 +731,8 @@ def init_video_model(
             num_frames=num_frames_pred,
             dim=pred_embed_dim + (proprio_emb_dim * 1 + action_emb_dim * 1) * (concat_dim),
             use_sdpa=use_sdpa,
+            planner_identified_input_scale=planner_identified_input_scale,
+            planner_identified_visual_dim=embed_dim,
         ).to(device)
     elif pred_type == "vjepa2_ac":
         # works with both action_encoder_inpred False or True, with action_conditioning in [’feature’, ‘token’],
@@ -782,6 +791,7 @@ def init_video_model(
             proprio_emb_dim=proprio_emb_dim,
             proprio_tokens=proprio_tokens,
             init_scale_factor_adaln=init_scale_factor_adaln,
+            planner_identified_input_scale=planner_identified_input_scale,
         ).to(device)
     logger.info(f"Predictor: {predictor}")
     pred_params = sum(p.numel() for p in predictor.parameters())

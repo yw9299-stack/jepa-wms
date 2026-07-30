@@ -11,6 +11,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 
+from app.plan_common.models.planner_identified_scale import PlannerIdentifiedInputScale
 from src.models.utils.modules import (
     MLP,
     Attention,
@@ -160,6 +161,7 @@ class VisionTransformerAdaLN(nn.Module):
         proprio_encoder_inpred=True,
         proprio_tokens=0,  # if proprio_encoding='token', proprio_tokens>0 will be used to encode the proprio input
         action_encoder_inpred=True,
+        planner_identified_input_scale=False,
         **kwargs,
     ):
         super().__init__()
@@ -167,6 +169,9 @@ class VisionTransformerAdaLN(nn.Module):
         self.predictor_embed_dim = predictor_embed_dim
         self.proprio_encoder_inpred = proprio_encoder_inpred
         self.action_encoder_inpred = action_encoder_inpred
+        self.planner_input_scale = (
+            PlannerIdentifiedInputScale(init_scale=1.0) if planner_identified_input_scale else None
+        )
 
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
@@ -318,6 +323,8 @@ class VisionTransformerAdaLN(nn.Module):
             proprio: B T 1 P (P=D if proprio_encoding='token' else P=proprio_dim)
         """
         # Map context tokens to pedictor dimensions
+        if self.planner_input_scale is not None:
+            x = self.planner_input_scale(x)
         x = self.predictor_embed(x)
         x = x.flatten(2, 4)  # [B, T, H*W, D]
         B, T, N, D = x.shape

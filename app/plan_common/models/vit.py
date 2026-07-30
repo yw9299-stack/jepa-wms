@@ -16,6 +16,8 @@ from einops import rearrange
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from app.plan_common.models.planner_identified_scale import PlannerIdentifiedInputScale
+
 # helpers
 NUM_FRAMES = 1
 NUM_PATCHES = 1
@@ -223,6 +225,8 @@ class ViTPredictor(nn.Module):
         dropout=0.0,
         emb_dropout=0.0,
         use_sdpa=True,
+        planner_identified_input_scale=False,
+        planner_identified_visual_dim=None,
     ):
         """
         ViT-based predictor for world models.
@@ -241,6 +245,12 @@ class ViTPredictor(nn.Module):
             use_sdpa: If True, use SDPA/Flash Attention for faster training.
                      If False, use original manual attention (for exact reproducibility
                      with DINO-WM baseline).
+            planner_identified_input_scale: Enable a positive scale on visual
+                     latent features before positional embeddings and predictor
+                     nonlinearities. Disabled by default for native compatibility.
+            planner_identified_visual_dim: Number of leading feature channels
+                     belonging to visual latents. Remaining proprio/action
+                     channels are never scaled.
         """
         super().__init__()
         assert pool in {"cls", "mean"}, "pool type must be either cls (cls token) or mean (mean pooling)"
@@ -256,9 +266,31 @@ class ViTPredictor(nn.Module):
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout, use_sdpa=use_sdpa)
         self.pool = pool
+        self.planner_identified_visual_dim = planner_identified_visual_dim
+        if planner_identified_input_scale:
+            if planner_identified_visual_dim is None:
+                raise ValueError("planner_identified_visual_dim is required when input scaling is enabled")
+            if not 0 < planner_identified_visual_dim <= dim:
+                raise ValueError(
+                    "planner_identified_visual_dim must be in "
+                    f"[1, {dim}], got {planner_identified_visual_dim}"
+                )
+            self.planner_input_scale = PlannerIdentifiedInputScale(init_scale=1.0)
+        else:
+            self.planner_input_scale = None
+
+    def scale_visual_input(self, x):
+        if self.planner_input_scale is None:
+            return x
+        visual_dim = self.planner_identified_visual_dim
+        visual = self.planner_input_scale(x[..., :visual_dim])
+        if visual_dim == x.shape[-1]:
+            return visual
+        return torch.cat((visual, x[..., visual_dim:]), dim=-1)
 
     def forward(self, x, **kwargs):  # x: (b, window_size * H/patch_size * W/patch_size, 384)
         b, n, _ = x.shape
+        x = self.scale_visual_input(x)
         x = x + self.pos_embedding[:, :n]
         x = self.dropout(x)
         x = self.transformer(x)
