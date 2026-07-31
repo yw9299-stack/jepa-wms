@@ -6,25 +6,16 @@
 #
 
 import unittest
-from contextlib import nullcontext
 
 import torch
-from torch.func import functional_call, jvp
+from torch.func import functional_call
 
 from app.plan_common.models.AdaLN_vit import VisionTransformerAdaLN
 from app.plan_common.models.planner_identified_scale import PlannerIdentifiedInputScale
 from app.plan_common.models.vit import ViTPredictor
 
 
-def _math_sdpa():
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-    except ImportError:
-        return nullcontext()
-    return sdpa_kernel(SDPBackend.MATH)
-
-
-def _directional_jvp(model, args):
+def _directional_scale_sensitivity(model, args, epsilon=1.0e-3):
     parameters = dict(model.named_parameters())
     log_scale_name = "planner_input_scale.log_scale"
     log_scale = parameters[log_scale_name]
@@ -37,15 +28,15 @@ def _directional_jvp(model, args):
             output = output[0]
         return output
 
-    # Flash/efficient SDPA does not implement forward-mode AD on every
-    # backend (notably CPU). The math kernel is equivalent for this test and
-    # supports the JVP used by the mechanism preflight.
-    with _math_sdpa():
-        output, derivative = jvp(
-            forward_with_log_scale,
-            (log_scale,),
-            (torch.ones_like(log_scale),),
-        )
+    # A centered finite difference tests the same directional sensitivity
+    # without depending on forward-AD support in the selected SDPA kernel.
+    # Some supported PyTorch CPU builds dispatch to flash SDPA, whose
+    # forward-mode AD derivative is not implemented.
+    with torch.no_grad():
+        output = forward_with_log_scale(log_scale)
+        output_plus = forward_with_log_scale(log_scale + epsilon)
+        output_minus = forward_with_log_scale(log_scale - epsilon)
+        derivative = (output_plus - output_minus) / (2.0 * epsilon)
     output = output.flatten(1)
     derivative = derivative.flatten(1)
     projection = (derivative * output).sum(dim=1, keepdim=True)
@@ -116,7 +107,7 @@ class TestDinoWmPlannerIdentifiedScale(unittest.TestCase):
         model = self._predictor(enabled=True)
         x = torch.randn(2, 8, 12)
         with model.planner_input_scale.landscape_gradient():
-            directional_norm = _directional_jvp(model, (x,))
+            directional_norm = _directional_scale_sensitivity(model, (x,))
         self.assertTrue(torch.isfinite(directional_norm))
         self.assertGreater(directional_norm.item(), 1.0e-6)
 
@@ -162,7 +153,7 @@ class TestAdaLnPlannerIdentifiedScale(unittest.TestCase):
         x = torch.randn(2, 2, 1, 2, 2, 12)
         actions = torch.randn(2, 2, 3)
         with model.planner_input_scale.landscape_gradient():
-            directional_norm = _directional_jvp(model, (x, actions))
+            directional_norm = _directional_scale_sensitivity(model, (x, actions))
         self.assertTrue(torch.isfinite(directional_norm))
         self.assertGreater(directional_norm.item(), 1.0e-6)
 
