@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 MODEL="${1:-}"
 case "$MODEL" in
   jepa_wm)
