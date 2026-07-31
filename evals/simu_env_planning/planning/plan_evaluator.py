@@ -553,14 +553,15 @@ class PlanEvaluator:
                 # Keep the minimal last state
                 for x in episode_obses:
                     x["visual"] = x["visual"][-agent.model.tubelet_size_enc :]
-            agent_goal_video_path = str(vis_work_dir / f"video_agent_goal_{'succ' if success else 'fail'}")
-            frames_list = [x["visual"] for x in episode_obses]
-            make_video(frames_list, 30, agent_goal_video_path, obs_concat_channels=env.obs_concat_channels)
-            make_video_pdf(
-                frames_list[:: self.cfg.frameskip],
-                agent_goal_video_path + ".pdf",
-                obs_concat_channels=env.obs_concat_channels,
-            )
+            if cfg.logging.optional_plots:
+                agent_goal_video_path = str(vis_work_dir / f"video_agent_goal_{'succ' if success else 'fail'}")
+                frames_list = [x["visual"] for x in episode_obses]
+                make_video(frames_list, 30, agent_goal_video_path, obs_concat_channels=env.obs_concat_channels)
+                make_video_pdf(
+                    frames_list[:: self.cfg.frameskip],
+                    agent_goal_video_path + ".pdf",
+                    obs_concat_channels=env.obs_concat_channels,
+                )
 
             coord_diffs, _repr_diffs = analyze_distances(
                 agent,

@@ -68,3 +68,54 @@ class PlannerIdentifiedInputScale(nn.Module):
 
     def forward(self, x):
         return x * self.effective_scale(x)
+
+
+def configure_planner_identified_scale(module, mode="learned", value=None, checkpoint_log_scale=None):
+    """Apply a runtime-only scale intervention and return an auditable record.
+
+    Exactly one :class:`PlannerIdentifiedInputScale` must be present.  The
+    learned parameter is never mutated: fixed interventions are stored in the
+    module's non-checkpointed runtime override.
+    """
+
+    scales = [child for child in module.modules() if isinstance(child, PlannerIdentifiedInputScale)]
+    if len(scales) != 1:
+        raise RuntimeError(f"Expected exactly one planner-identified input scale, found {len(scales)}")
+    scale = scales[0]
+    learned_log_scale = float(scale.log_scale.detach().cpu())
+    learned_scale = math.exp(learned_log_scale)
+    if checkpoint_log_scale is not None and not math.isclose(
+        learned_log_scale,
+        float(checkpoint_log_scale),
+        rel_tol=0.0,
+        abs_tol=1.0e-7,
+    ):
+        raise RuntimeError(
+            "Loaded planner scale does not match the checkpoint: "
+            f"module={learned_log_scale:.9g}, checkpoint={float(checkpoint_log_scale):.9g}"
+        )
+
+    mode = str(mode).lower()
+    if mode == "learned":
+        if value is not None:
+            raise ValueError("A learned-scale intervention must not provide a fixed value")
+        scale.clear_runtime_override()
+        effective_scale = learned_scale
+    elif mode == "fixed":
+        if value is None:
+            raise ValueError("A fixed-scale intervention requires a value")
+        scale.set_runtime_override(value)
+        effective_scale = float(value)
+    else:
+        raise ValueError(f"Unknown planner scale intervention mode: {mode!r}")
+
+    return {
+        "mode": mode,
+        "requested_value": None if value is None else float(value),
+        "checkpoint_log_scale": learned_log_scale,
+        "checkpoint_learned_scale": learned_scale,
+        "effective_scale": effective_scale,
+        "parameter_unchanged": math.isclose(
+            float(scale.log_scale.detach().cpu()), learned_log_scale, rel_tol=0.0, abs_tol=0.0
+        ),
+    }

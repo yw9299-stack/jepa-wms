@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from einops import rearrange
 from tensordict.tensordict import TensorDict
 
 from app.plan_common.datasets.droid_dset import compute_new_pose
+from app.plan_common.models.planner_identified_scale import configure_planner_identified_scale
 from app.plan_common.models.wm_heads import WorldModelPoseReadoutHead, WorldModelViTImageHead
 from app.vjepa_wm.utils import (
     clean_state_dict,
@@ -58,6 +60,10 @@ def init_module(
     Returns:
         EncPredWM: Wrapped VideoWM model ready for encoding and prediction.
     """
+    wrapper_kwargs = dict(wrapper_kwargs or {})
+    scale_intervention_mode = wrapper_kwargs.pop("planner_identified_scale_intervention_mode", None)
+    scale_intervention_value = wrapper_kwargs.pop("planner_identified_scale_intervention_value", None)
+
     img_size = cfgs_data.get("img_size", 256)
     frameskip = cfgs_data.get("custom").get("frameskip", 1)
     action_skip = cfgs_data.get("custom").get("action_skip", 1)
@@ -153,6 +159,16 @@ def init_module(
         checkpoint_source = Path(folder) / checkpoint
 
     checkpoint_data = fetch_checkpoint(checkpoint_source, device="cpu")
+    checkpoint_log_scale = None
+    if scale_intervention_mode is not None:
+        predictor_state = clean_state_dict(checkpoint_data.get("predictor", {}))
+        scale_keys = [key for key in predictor_state if key.endswith("planner_input_scale.log_scale")]
+        if len(scale_keys) != 1:
+            raise RuntimeError(
+                "Scale intervention requires exactly one checkpoint scale parameter, "
+                f"found {scale_keys}"
+            )
+        checkpoint_log_scale = float(predictor_state[scale_keys[0]].detach().cpu())
 
     (
         predictor,
@@ -194,8 +210,6 @@ def init_module(
                 logger.info(f"loaded pretrained head named {name} from epoch {epoch} with msg: {msg}")
                 del head_checkpoint
 
-    if wrapper_kwargs is None:
-        wrapper_kwargs = {}
     proprio_mode = wrapper_kwargs.get("proprio_mode", "predict_proprio")
     proprio_loss = proprio_mode == "predict_proprio"
 
@@ -241,12 +255,22 @@ def init_module(
     }
     model = VideoWM(**wm_kwargs)
     model.eval()
+    scale_audit = None
+    if scale_intervention_mode is not None:
+        scale_audit = configure_planner_identified_scale(
+            model.predictor,
+            mode=scale_intervention_mode,
+            value=scale_intervention_value,
+            checkpoint_log_scale=checkpoint_log_scale,
+        )
+        logger.info("PI_LTC_SCALE_AUDIT %s", json.dumps(scale_audit, sort_keys=True))
     model = EncPredWM(
         model,
         action_dim=model_action_dim,
         preprocessor=preprocessor,
         **wrapper_kwargs,
     )
+    model.planner_scale_audit = scale_audit
     return model
 
 

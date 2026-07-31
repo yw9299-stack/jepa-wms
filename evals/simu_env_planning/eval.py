@@ -4,7 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import csv
 import importlib
+import json
 import logging
 import os
 from time import time
@@ -116,6 +118,13 @@ def main(args_eval, resume_preempt=False):
     )
     log.info("✅ Loaded encoder and predictor")
 
+    scale_audit = getattr(model, "planner_scale_audit", None)
+    if rank == 0 and scale_audit is not None:
+        scale_audit_path = os.path.join(folder, "planner_scale_audit.json")
+        with open(scale_audit_path, "w") as audit_file:
+            json.dump(scale_audit, audit_file, indent=2, sort_keys=True)
+        log.info(f"Saved planner scale audit to {scale_audit_path}")
+
     # -- Launch eval
     main_distributed_episodes_eval(args_eval, model=model, dset=dset, preprocessor=preprocessor, rank=rank)
 
@@ -198,6 +207,7 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
     evaluator = PlanEvaluator(cfg, agent)
     results = dict()
     processed_episodes = set()
+    episode_records = []
     for task_pos, (task_idx, episodes) in enumerate(zip(cfg.task_indices, cfg.episodes_per_task)):
         (
             ep_rewards,
@@ -251,6 +261,19 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
             if (task_idx, ep) in processed_episodes:
                 continue  # Skip duplicate dummy episodes logging
             processed_episodes.add((task_idx, ep))
+            episode_records.append(
+                {
+                    "rank": int(cfg.rank),
+                    "task_index": int(task_idx),
+                    "task": str(cfg.tasks[task_idx]),
+                    "episode_index": int(ep),
+                    "episode_seed": int((cfg.local_seed * cfg.local_seed + ep * cfg.local_seed) % (2**32 - 2)),
+                    "success": int(bool(success)),
+                    "expert_success": int(bool(expert_success)),
+                    "episode_reward": float(ep_reward),
+                    "episode_time": float(episode_end_time - episode_start_time),
+                }
+            )
             ep_rewards.append(ep_reward)
             ep_successes.append(success)
             ep_expert_successes.append(expert_success)
@@ -300,7 +323,31 @@ def main_distributed_episodes_eval(cfg: dict, model=None, dset=None, preprocesso
             log.info(f"{combined_results=}")
     else:
         combined_results = {key: value[0] / value[1] if value[1] > 0 else 0 for key, value in results.items()}
+    if cfg.distributed.distribute_multitask_eval:
+        all_episode_records = [None] * cfg.world_size if rank == 0 else None
+        dist.gather_object(episode_records, object_gather_list=all_episode_records, dst=0)
+        if rank == 0:
+            combined_episode_records = [record for records in all_episode_records for record in records]
+        else:
+            combined_episode_records = []
+    else:
+        combined_episode_records = episode_records
     if cfg.rank == 0:
+        if cfg.logging.get("save_episode_csv", False):
+            combined_episode_records.sort(key=lambda row: (row["task_index"], row["episode_index"]))
+            episode_keys = [(row["task_index"], row["episode_index"]) for row in combined_episode_records]
+            expected_count = len(cfg.tasks) * int(cfg.meta.eval_episodes)
+            if len(episode_keys) != expected_count or len(set(episode_keys)) != expected_count:
+                raise RuntimeError(
+                    "Episode audit is incomplete or duplicated: "
+                    f"rows={len(episode_keys)}, unique={len(set(episode_keys))}, expected={expected_count}"
+                )
+            episode_csv_path = cfg.work_dir / "episode_outcomes.csv"
+            with open(episode_csv_path, "w", newline="") as episode_csv:
+                writer = csv.DictWriter(episode_csv, fieldnames=list(combined_episode_records[0]))
+                writer.writeheader()
+                writer.writerows(combined_episode_records)
+            log.info(f"Saved paired episode outcomes to {episode_csv_path}")
         metrics = {"total_time": time() - start_time}
         # Create average over tasks
         logger.pprint_multitask(combined_results | metrics, cfg)

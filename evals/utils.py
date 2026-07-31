@@ -70,7 +70,10 @@ def make_datasets(cfgs_data, cfgs_data_aug, world_size=1, rank=0, filter_first_e
     cfgs_droid = cfgs_data.get("droid", {})
 
     datasets = cfgs_data.get("datasets", [])
-    dataset_paths = get_dataset_paths(datasets)
+    if cfgs_data.get("dataset_type") == "stablewm_h5":
+        dataset_paths = cfgs_data.get("paths", [])
+    else:
+        dataset_paths = get_dataset_paths(datasets)
     val_datasets = cfgs_validation.get("val_datasets", [])
     val_dataset_paths = get_dataset_paths(val_datasets) if val_datasets else None
 
@@ -84,6 +87,7 @@ def make_datasets(cfgs_data, cfgs_data_aug, world_size=1, rank=0, filter_first_e
         "loader",
         "custom",
         "droid",
+        "paths",
     ]
     data_kwargs = {k: v for k, v in cfgs_data.items() if k not in excluded_keys}
 

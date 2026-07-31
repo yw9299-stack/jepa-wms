@@ -11,7 +11,10 @@ import torch
 from torch.func import functional_call
 
 from app.plan_common.models.AdaLN_vit import VisionTransformerAdaLN
-from app.plan_common.models.planner_identified_scale import PlannerIdentifiedInputScale
+from app.plan_common.models.planner_identified_scale import (
+    PlannerIdentifiedInputScale,
+    configure_planner_identified_scale,
+)
 from app.plan_common.models.vit import ViTPredictor
 
 
@@ -69,6 +72,29 @@ class TestPlannerIdentifiedInputScale(unittest.TestCase):
         self.assertTrue(torch.equal(scale(x), x))
         with self.assertRaises(ValueError):
             scale.set_runtime_override(0.0)
+
+    def test_same_checkpoint_intervention_is_audited_without_mutating_parameter(self):
+        module = torch.nn.Sequential(PlannerIdentifiedInputScale(init_scale=1.2))
+        original = module[0].log_scale.detach().clone()
+
+        audit = configure_planner_identified_scale(
+            module,
+            mode="fixed",
+            value=0.6,
+            checkpoint_log_scale=float(original),
+        )
+        self.assertEqual(audit["effective_scale"], 0.6)
+        self.assertTrue(audit["parameter_unchanged"])
+        self.assertTrue(torch.equal(module[0].log_scale.detach(), original))
+        self.assertEqual(module[0].runtime_override, 0.6)
+
+        learned = configure_planner_identified_scale(
+            module,
+            mode="learned",
+            checkpoint_log_scale=float(original),
+        )
+        self.assertIsNone(module[0].runtime_override)
+        self.assertAlmostEqual(learned["effective_scale"], 1.2, places=6)
 
 
 class TestDinoWmPlannerIdentifiedScale(unittest.TestCase):
