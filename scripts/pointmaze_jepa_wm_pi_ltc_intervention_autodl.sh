@@ -59,6 +59,7 @@ test "$UNIT_RC" -eq 0 || fail "scale intervention unit preflight status=$UNIT_RC
 python scripts/generate_pointmaze_pi_ltc_intervention_eval.py \
   --checkpoint-dir "$CHECKPOINT_DIR" \
   --checkpoint "$CHECKPOINT" \
+  --source-h5 "$PI_LTC_POINTMAZE_SOURCE" \
   --episodes "$EPISODES" \
   --eval-seed "$EVAL_SEED" \
   --label "$LABEL"

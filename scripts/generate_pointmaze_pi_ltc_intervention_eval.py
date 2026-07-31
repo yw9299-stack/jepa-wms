@@ -59,6 +59,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", default="jepa-latest.pth.tar")
+    parser.add_argument("--source-h5", type=Path, required=True)
     parser.add_argument("--episodes", type=int, required=True)
     parser.add_argument("--eval-seed", type=int, default=1)
     parser.add_argument("--label", required=True)
@@ -75,8 +76,11 @@ def main():
     args = parser.parse_args()
 
     checkpoint_path = (args.checkpoint_dir / args.checkpoint).resolve()
+    source_h5 = args.source_h5.resolve()
     if not checkpoint_path.is_file():
         raise SystemExit(f"[STOP] missing checkpoint: {checkpoint_path}")
+    if not source_h5.is_file():
+        raise SystemExit(f"[STOP] missing source HDF5: {source_h5}")
     if args.episodes <= 0:
         raise SystemExit("[STOP] episodes must be positive")
     epoch, scale_key, log_scale = load_checkpoint_audit(checkpoint_path)
@@ -125,6 +129,12 @@ def main():
             "scale_key": scale_key,
             "log_scale": log_scale,
             "learned_scale": math.exp(log_scale),
+        },
+        "data_source": {
+            "path": str(source_h5),
+            "size": source_h5.stat().st_size,
+            "mtime_ns": source_h5.stat().st_mtime_ns,
+            "purpose": "action/state normalization metadata only",
         },
         "evaluation": protocol,
         "arms": {
