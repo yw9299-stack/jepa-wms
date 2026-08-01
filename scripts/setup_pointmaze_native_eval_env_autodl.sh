@@ -27,9 +27,23 @@ test -x "$CONDA_BIN" || fail "conda executable not found: $CONDA_BIN"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   if [ -e "$ENV_PREFIX" ]; then
-    fail "incomplete environment already exists: $ENV_PREFIX; preserve/inspect it before retrying"
+    RESOLVED_ENV="$(readlink -m -- "$ENV_PREFIX")"
+    DEFAULT_ENV="/root/autodl-tmp/jepa_wms_native_eval_py310"
+    if [ "$RESOLVED_ENV" != "$DEFAULT_ENV" ]; then
+      fail "incomplete custom environment already exists: $RESOLVED_ENV; preserve/inspect it before retrying"
+    fi
+    echo "[cleanup] removing incomplete conda prefix from the failed setup: $RESOLVED_ENV"
+    rm -rf -- "$RESOLVED_ENV"
   fi
-  "$CONDA_BIN" create --prefix "$ENV_PREFIX" python=3.10 ffmpeg=7 -c conda-forge -y
+  # Ignore the host's .condarc: some AutoDL images still list the retired
+  # pkgs/free repository, which returns invalid repodata. Native evaluation
+  # does not save video, so only Python and pip are needed from conda here.
+  "$CONDA_BIN" create \
+    --prefix "$ENV_PREFIX" \
+    --override-channels \
+    --channel https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main \
+    python=3.10 pip \
+    -y
   CREATE_RC=$?
   test "$CREATE_RC" -eq 0 || fail "conda environment creation status=$CREATE_RC"
 fi
