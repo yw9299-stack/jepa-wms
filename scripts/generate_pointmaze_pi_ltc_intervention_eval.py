@@ -88,7 +88,7 @@ def main():
 
     training = yaml.safe_load(args.training_config.read_text())
     output_root = args.checkpoint_dir / (
-        f"native_pointmaze_cem30_scale_{args.label}_seed{args.eval_seed}_ep{args.episodes}_v2"
+        f"native_pointmaze_cem30_scale_{args.label}_seed{args.eval_seed}_ep{args.episodes}_v3"
     )
     tag = "native_cem30_s300_k10_h6_nas6_ctxt2"
     protocol = {
@@ -115,6 +115,7 @@ def main():
         Path("evals/simu_env_planning/eval.py"),
         Path("evals/simu_env_planning/planning/plan_evaluator.py"),
         Path("evals/utils.py"),
+        Path("scripts/preflight_pointmaze_native_eval.py"),
         Path(__file__),
     ]
     manifest = {
