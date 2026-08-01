@@ -25,6 +25,7 @@ def main():
     import mujoco_py
 
     from evals.simu_env_planning.envs.init import make_env
+    from evals.simu_env_planning.planning.common.parser import parse_cfg
 
     config = OmegaConf.create(yaml.safe_load(args.config.read_text()))
     if config.task_specification.task != "maze-base":
@@ -34,6 +35,11 @@ def main():
         raise SystemExit(
             f"[STOP] evaluation frameskip={config.frameskip} differs from model data frameskip={model_frameskip}"
         )
+    # Mirror main_distributed_episodes_eval: it assigns work_dir and runs the
+    # shared parser before the first make_env call. The parser supplies
+    # task_specification.multitask and the resolved task list.
+    config.work_dir = args.audit.parent
+    config = parse_cfg(config)
 
     env = None
     try:
