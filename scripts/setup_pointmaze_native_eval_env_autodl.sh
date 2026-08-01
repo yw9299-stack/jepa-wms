@@ -30,6 +30,8 @@ test -f "$POINTMAZE_REQUIREMENTS" || fail "missing PointMaze requirements: $POIN
 # AutoDL commonly places the uv cache and conda prefix on different mounts.
 # Copy mode is intentional here and avoids a harmless hardlink warning.
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-120}"
+export UV_HTTP_RETRIES="${UV_HTTP_RETRIES:-10}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   if [ -e "$ENV_PREFIX" ]; then
@@ -75,23 +77,44 @@ UV_RC=$?
 test "$UV_RC" -eq 0 || fail "uv installation status=$UV_RC"
 test -x "$UV_BIN" || fail "uv executable not found after installation: $UV_BIN"
 
+uv_pip_install() {
+  local label="$1"
+  shift
+  local attempt=1
+  local status=1
+  while [ "$attempt" -le 4 ]; do
+    echo "[uv install] $label attempt=$attempt/4"
+    "$UV_BIN" pip install --python "$PYTHON_BIN" "$@"
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      return 0
+    fi
+    if [ "$attempt" -lt 4 ]; then
+      echo "[retry] $label failed with status=$status; uv cache is preserved"
+      sleep $((attempt * 3))
+    fi
+    attempt=$((attempt + 1))
+  done
+  return "$status"
+}
+
 # RTX 5090 requires a Blackwell-capable PyTorch wheel. Install it explicitly
 # before resolving the repository dependencies so the generic torch>=2.7
 # requirement cannot select an unsuitable CUDA build.
-"$UV_BIN" pip install --python "$PYTHON_BIN" \
+uv_pip_install "CUDA 12.8 PyTorch" \
   --index-url https://download.pytorch.org/whl/cu128 \
   "torch==2.7.1" "torchvision==0.22.1"
 TORCH_RC=$?
 test "$TORCH_RC" -eq 0 || fail "CUDA 12.8 PyTorch installation status=$TORCH_RC"
 
 # The legacy Gym/D4RL/MuJoCo-py stack is not NumPy-2/Cython-3 compatible.
-"$UV_BIN" pip install --python "$PYTHON_BIN" \
+uv_pip_install "legacy Gym/MuJoCo compatibility pins" \
   "numpy<2" "Cython<3" "setuptools<70" "wheel"
 LEGACY_RC=$?
 test "$LEGACY_RC" -eq 0 || fail "legacy compatibility dependency status=$LEGACY_RC"
 
 echo "[dependencies] installing the PointMaze-only evaluation runtime"
-"$UV_BIN" pip install --python "$PYTHON_BIN" \
+uv_pip_install "PointMaze-only evaluation runtime" \
   --requirements "$POINTMAZE_REQUIREMENTS"
 POINTMAZE_RC=$?
 test "$POINTMAZE_RC" -eq 0 || fail "PointMaze-only dependency installation status=$POINTMAZE_RC"
@@ -99,7 +122,7 @@ test "$POINTMAZE_RC" -eq 0 || fail "PointMaze-only dependency installation statu
 # Do not resolve pyproject.toml here. Its complete research environment also
 # installs MetaWorld, PushT, Wall, and other simulators that this evaluation
 # neither imports nor executes.
-"$UV_BIN" pip install --python "$PYTHON_BIN" --no-deps --editable "$REPO_ROOT"
+uv_pip_install "JEPA-WM editable package" --no-deps --editable "$REPO_ROOT"
 REPO_RC=$?
 test "$REPO_RC" -eq 0 || fail "JEPA-WM no-dependency editable installation status=$REPO_RC"
 
