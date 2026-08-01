@@ -29,6 +29,11 @@ def main():
     config = OmegaConf.create(yaml.safe_load(args.config.read_text()))
     if config.task_specification.task != "maze-base":
         raise SystemExit(f"[STOP] unexpected task: {config.task_specification.task}")
+    model_frameskip = int(config.model_kwargs.data.custom.frameskip)
+    if int(config.frameskip) != model_frameskip:
+        raise SystemExit(
+            f"[STOP] evaluation frameskip={config.frameskip} differs from model data frameskip={model_frameskip}"
+        )
 
     env = None
     try:
@@ -60,6 +65,7 @@ def main():
             "mujoco_py": mujoco_py.__version__,
             "task": str(config.task_specification.task),
             "seed": int(config.meta.seed),
+            "frameskip": int(config.frameskip),
             "initial_state": np.asarray(initial).tolist(),
             "goal_state": np.asarray(goal).tolist(),
             "initial_observation_shape": list(initial_obs.shape),

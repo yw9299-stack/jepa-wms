@@ -38,6 +38,7 @@ export JEPAWM_LOGS="${JEPAWM_LOGS:-/root/autodl-tmp/lewm_data/jepa_wms}"
 export MUJOCO_PY_MUJOCO_PATH="$MUJOCO_ROOT"
 export LD_LIBRARY_PATH="$MUJOCO_ROOT/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export D4RL_SUPPRESS_IMPORT_ERROR=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -56,6 +57,29 @@ fail() {
   exit 1
 }
 
+cleanup_failed_preflight_output() {
+  if [ ! -d "$OUTPUT_ROOT" ]; then
+    return 0
+  fi
+  if [ -f "$OUTPUT_ROOT/native_environment_preflight.json" ]; then
+    return 0
+  fi
+  if find "$OUTPUT_ROOT" -type f -name episode_outcomes.csv -print -quit | grep -q .; then
+    fail "incomplete output contains episode outcomes; preserve and inspect it: $OUTPUT_ROOT"
+  fi
+
+  local resolved_checkpoint
+  local resolved_output
+  resolved_checkpoint="$(readlink -m -- "$CHECKPOINT_DIR")"
+  resolved_output="$(readlink -m -- "$OUTPUT_ROOT")"
+  case "$resolved_output" in
+    "$resolved_checkpoint"/native_pointmaze_cem30_scale_*) ;;
+    *) fail "refusing to clean unexpected output path: $resolved_output" ;;
+  esac
+  echo "[cleanup] removing failed preflight-only output: $resolved_output"
+  rm -rf -- "$resolved_output"
+}
+
 test -f "$CHECKPOINT_DIR/$CHECKPOINT" || fail "missing checkpoint: $CHECKPOINT_DIR/$CHECKPOINT"
 test -f "$PI_LTC_POINTMAZE_SOURCE" || fail "missing source: $PI_LTC_POINTMAZE_SOURCE"
 
@@ -66,6 +90,8 @@ if [ ! -x "$EVAL_PYTHON" ] || [ ! -f "$EVAL_READY_STAMP" ]; then
   test "$SETUP_RC" -eq 0 || fail "native PointMaze environment setup status=$SETUP_RC"
 fi
 test -x "$EVAL_PYTHON" || fail "evaluation Python not found: $EVAL_PYTHON"
+
+cleanup_failed_preflight_output
 
 "$EVAL_PYTHON" -m unittest tests.models.test_planner_identified_scale
 UNIT_RC=$?

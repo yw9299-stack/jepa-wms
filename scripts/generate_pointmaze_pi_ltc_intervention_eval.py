@@ -87,6 +87,9 @@ def main():
     epoch, scale_key, log_scale = load_checkpoint_audit(checkpoint_path)
 
     training = yaml.safe_load(args.training_config.read_text())
+    frameskip = int(training["data"]["custom"]["frameskip"])
+    if frameskip <= 0:
+        raise SystemExit(f"[STOP] invalid training frameskip={frameskip}")
     output_root = args.checkpoint_dir / (
         f"native_pointmaze_cem30_scale_{args.label}_seed{args.eval_seed}_ep{args.episodes}_v3"
     )
@@ -99,6 +102,7 @@ def main():
         "episodes": args.episodes,
         "image_size": 224,
         "context_window": 2,
+        "frameskip": frameskip,
         "objective": "latent_L2_alpha0.1",
         "cem_iterations": 30,
         "cem_samples": 300,
@@ -185,6 +189,10 @@ def main():
         config = configs[0]
         config["nodes"] = 1
         config["tasks_per_node"] = 1
+        # eval.main normally injects this from model_kwargs immediately before
+        # model construction. Write it into the generated artifact as well so
+        # environment preflight and the real evaluator consume the same value.
+        config["frameskip"] = frameskip
         config["meta"]["seed"] = args.eval_seed
         config["meta"]["eval_episodes"] = args.episodes
         config["tag"] = tag
