@@ -1,0 +1,30 @@
+# Runtime dependencies for JEPA-WM's native PointMaze evaluation only.
+#
+# Keep this list separate from pyproject.toml: the full project dependency set
+# includes unrelated simulators such as MetaWorld, PushT, and Wall.
+numpy<2
+h5py
+pandas
+scipy
+einops
+timm>=1.0.19
+tensordict>=0.9.1
+decord>=0.6.0
+opencv-python-headless
+pillow
+imageio
+imageio-ffmpeg
+matplotlib
+seaborn
+lpips>=0.1.4
+nevergrad
+omegaconf
+ruamel.yaml
+PyYAML
+termcolor
+tqdm
+psutil
+gym==0.23.1
+mujoco-py==2.1.2.14
+patchelf
+d4rl @ git+https://github.com/Farama-Foundation/D4RL.git@master

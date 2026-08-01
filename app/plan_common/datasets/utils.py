@@ -8,19 +8,8 @@
 from logging import getLogger
 from typing import Callable
 
-import decord
 import torch
 import torch.utils.data
-
-from src.datasets.data_manager import init_data as init_data_src
-
-from .droid_dset import DROIDVideoDataset
-from .metaworld_hf_dset import load_metaworld_hf_slice_train_val
-from .point_maze_dset import load_point_maze_slice_train_val
-from .pusht_dset import load_pusht_slice_train_val
-from .robocasa_dset import load_robocasa_slice_train_val
-from .stablewm_h5_dset import load_stablewm_h5_train_val
-from .wall_dset import load_wall_slice_train_val
 
 # ----------------
 
@@ -89,6 +78,8 @@ def init_data(
     logger.info(f"📂 Data paths: {data_paths}")
     shuffle = True
     if dataset_type == "stablewm_h5":
+        from .stablewm_h5_dset import load_stablewm_h5_train_val
+
         if len(data_paths) != 1:
             raise ValueError("stablewm_h5 requires exactly one source HDF5")
         datasets, traj_dsets, train_episode_ids = load_stablewm_h5_train_val(
@@ -153,6 +144,8 @@ def init_data(
         )
     elif dataset_type == "custom":
         if all("droid" in p for p in data_paths) or all("franka_custom" in p for p in data_paths):
+            from .droid_dset import DROIDVideoDataset
+
             # We never pass the normalize_action argument to DROIDVideoDataset
             dataset = DROIDVideoDataset(
                 data_path=data_paths[0],
@@ -186,6 +179,8 @@ def init_data(
             datasets = {"train": dataset, "valid": val_dataset}
             traj_dsets = {"train": dataset, "valid": val_dataset}
         elif all("metaworld" in p.lower() for p in data_paths) or all("tdmpc2" in p for p in data_paths):
+            from .metaworld_hf_dset import load_metaworld_hf_slice_train_val
+
             datasets, traj_dsets = load_metaworld_hf_slice_train_val(
                 transform,
                 n_rollout=None,
@@ -207,6 +202,8 @@ def init_data(
             dataset = datasets["train"]
             shuffle = True
         elif all("pusht" in p for p in data_paths):
+            from .pusht_dset import load_pusht_slice_train_val
+
             datasets, traj_dsets = load_pusht_slice_train_val(
                 transform,
                 n_rollout=None,
@@ -226,6 +223,8 @@ def init_data(
             dataset = datasets["train"]
             shuffle = False
         elif all("point_maze" in p for p in data_paths):
+            from .point_maze_dset import load_point_maze_slice_train_val
+
             datasets, traj_dsets = load_point_maze_slice_train_val(
                 transform,
                 n_rollout=None,
@@ -246,6 +245,8 @@ def init_data(
             dataset = datasets["train"]
             shuffle = False
         elif all("wall" in p for p in data_paths):
+            from .wall_dset import load_wall_slice_train_val
+
             datasets, traj_dsets = load_wall_slice_train_val(
                 transform,
                 n_rollout=None,
@@ -264,6 +265,8 @@ def init_data(
             )
             dataset = datasets["train"]
         elif all("robocasa" in p for p in data_paths):
+            from .robocasa_dset import load_robocasa_slice_train_val
+
             datasets, traj_dsets = load_robocasa_slice_train_val(
                 transform,
                 n_rollout=None,
@@ -350,6 +353,10 @@ def init_data(
             viz_val_data_loader,
         )
     else:
+        import decord
+
+        from src.datasets.data_manager import init_data as init_data_src
+
         decord.bridge.set_bridge("native")
         data_loader, dist_sampler = init_data_src(
             data=dataset_type,

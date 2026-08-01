@@ -7,8 +7,6 @@
 
 import os
 
-import clusterscope
-
 from src.utils.logging import get_logger
 
 logger = get_logger("Cluster utils")
@@ -17,6 +15,13 @@ logger = get_logger("Cluster utils")
 # These should be set before running the code
 # See README.md for setup instructions
 JEPAWM_DSET = os.environ.get("JEPAWM_DSET", None)
+
+
+def _cluster_name():
+    """Import cluster discovery only when a cluster-specific path is needed."""
+    import clusterscope
+
+    return clusterscope.cluster()
 
 
 def slurm_account_partition_and_qos(low_pri: bool) -> tuple:
@@ -103,7 +108,7 @@ def get_dataset_path(dataset: str, cluster=None) -> str:
     Uses 'default' cluster if environment variables are set, otherwise tries the actual cluster name.
     """
     if cluster is None:
-        cluster = clusterscope.cluster()
+        cluster = _cluster_name()
 
     # Try 'default' first if JEPAWM_DSET is set
     if JEPAWM_DSET is not None and "default" in DATASET_PATHS_BY_CLUSTER:
@@ -153,7 +158,7 @@ def dataset_paths() -> dict[str, str]:
         return DATASET_PATHS_BY_CLUSTER["default"]
 
     # Fallback to cluster-specific paths
-    cluster = clusterscope.cluster()
+    cluster = _cluster_name()
     if cluster in DATASET_PATHS_BY_CLUSTER:
         return DATASET_PATHS_BY_CLUSTER[cluster]
 

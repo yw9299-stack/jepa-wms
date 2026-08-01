@@ -19,9 +19,12 @@ from evals.simu_env_planning.envs.wrappers.tensor import TensorWrapper
 _lazy_env_cache = {}
 
 _LAZY_ENV_CONFIG = {
+    "droid": ("evals.simu_env_planning.envs.droid_dset_dummy_env", "DROID dummy environment"),
     "maze": ("evals.simu_env_planning.envs.pointmaze_gym_wrap", "MuJoCo 2.1"),
+    "pusht": ("evals.simu_env_planning.envs.pusht_gym_wrap", "PushT"),
     "robocasa": ("evals.simu_env_planning.envs.robocasa", "RoboCasa"),
     "metaworld": ("evals.simu_env_planning.envs.metaworld", "Metaworld"),
+    "wall": ("evals.simu_env_planning.envs.wall_gym_wrap", "Wall"),
 }
 
 
@@ -37,11 +40,6 @@ def _lazy_make_env(env_key, cfg):
             raise ImportError(f"Missing dependencies for {install_name}. See README.md. Error: {e}") from e
     return _lazy_env_cache[env_key](cfg)
 
-
-# These environments have minimal dependencies and can be imported eagerly
-from evals.simu_env_planning.envs.droid_dset_dummy_env import make_env as make_droid_dset_dummy_env
-from evals.simu_env_planning.envs.pusht_gym_wrap import make_env as make_pusht_env
-from evals.simu_env_planning.envs.wall_gym_wrap import make_env as make_wall_env
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -95,15 +93,15 @@ def make_env(cfg):
         if cfg.task_specification.task.startswith("mw-"):
             env = _lazy_make_env("metaworld", cfg)
         elif cfg.task_specification.task.startswith("pusht-"):
-            env = make_pusht_env(cfg)
+            env = _lazy_make_env("pusht", cfg)
         elif cfg.task_specification.task.startswith("wall-"):
-            env = make_wall_env(cfg)
+            env = _lazy_make_env("wall", cfg)
         elif cfg.task_specification.task.startswith("maze-"):
             env = _lazy_make_env("maze", cfg)
         elif cfg.task_specification.task.startswith("robocasa-"):
             env = _lazy_make_env("robocasa", cfg)
         elif cfg.task_specification.task.startswith("droid-"):
-            env = make_droid_dset_dummy_env(cfg)
+            env = _lazy_make_env("droid", cfg)
 
         env = TensorWrapper(env)
         if cfg.task_specification.get("obs", "state") in ["rgb", "rgb_state"]:

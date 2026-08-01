@@ -7,7 +7,7 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 EVAL_ENV_PREFIX="${PI_LTC_JEPA_WM_EVAL_ENV:-/root/autodl-tmp/jepa_wms_native_eval_py310}"
 EVAL_PYTHON="${PI_LTC_JEPA_WM_EVAL_PYTHON:-$EVAL_ENV_PREFIX/bin/python}"
-EVAL_READY_STAMP="$EVAL_ENV_PREFIX/.pi_ltc_native_pointmaze_ready_v1"
+EVAL_READY_STAMP="$EVAL_ENV_PREFIX/.pi_ltc_native_pointmaze_ready_v2"
 MUJOCO_ROOT="${MUJOCO_PY_MUJOCO_PATH:-/root/autodl-tmp/jepa_wms_native_eval_assets/mujoco210}"
 
 MODE="${1:-screen}"

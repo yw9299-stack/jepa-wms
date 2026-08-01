@@ -8,7 +8,8 @@ MUJOCO_ROOT="${MUJOCO_PY_MUJOCO_PATH:-$ASSET_ROOT/mujoco210}"
 CONDA_BIN="${PI_LTC_CONDA_BIN:-/root/miniconda3/bin/conda}"
 PYTHON_BIN="$ENV_PREFIX/bin/python"
 UV_BIN="$ENV_PREFIX/bin/uv"
-READY_STAMP="$ENV_PREFIX/.pi_ltc_native_pointmaze_ready_v1"
+READY_STAMP="$ENV_PREFIX/.pi_ltc_native_pointmaze_ready_v2"
+POINTMAZE_REQUIREMENTS="$REPO_ROOT/requirements/pointmaze-native-eval.txt"
 
 fail() {
   echo "[STOP] $*"
@@ -24,6 +25,11 @@ echo "python=3.10 (required by the upstream JEPA-WM repository)"
 echo "================================================================"
 
 test -x "$CONDA_BIN" || fail "conda executable not found: $CONDA_BIN"
+test -f "$POINTMAZE_REQUIREMENTS" || fail "missing PointMaze requirements: $POINTMAZE_REQUIREMENTS"
+
+# AutoDL commonly places the uv cache and conda prefix on different mounts.
+# Copy mode is intentional here and avoids a harmless hardlink warning.
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   if [ -e "$ENV_PREFIX" ]; then
@@ -84,9 +90,18 @@ test "$TORCH_RC" -eq 0 || fail "CUDA 12.8 PyTorch installation status=$TORCH_RC"
 LEGACY_RC=$?
 test "$LEGACY_RC" -eq 0 || fail "legacy compatibility dependency status=$LEGACY_RC"
 
-"$UV_BIN" pip install --python "$PYTHON_BIN" --editable "$REPO_ROOT"
+echo "[dependencies] installing the PointMaze-only evaluation runtime"
+"$UV_BIN" pip install --python "$PYTHON_BIN" \
+  --requirements "$POINTMAZE_REQUIREMENTS"
+POINTMAZE_RC=$?
+test "$POINTMAZE_RC" -eq 0 || fail "PointMaze-only dependency installation status=$POINTMAZE_RC"
+
+# Do not resolve pyproject.toml here. Its complete research environment also
+# installs MetaWorld, PushT, Wall, and other simulators that this evaluation
+# neither imports nor executes.
+"$UV_BIN" pip install --python "$PYTHON_BIN" --no-deps --editable "$REPO_ROOT"
 REPO_RC=$?
-test "$REPO_RC" -eq 0 || fail "JEPA-WM dependency installation status=$REPO_RC"
+test "$REPO_RC" -eq 0 || fail "JEPA-WM no-dependency editable installation status=$REPO_RC"
 
 export MUJOCO_PY_MUJOCO_PATH="$MUJOCO_ROOT"
 export LD_LIBRARY_PATH="$MUJOCO_ROOT/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -104,6 +119,11 @@ import d4rl
 import mujoco_py
 import torch
 
+# Import the exact local evaluation entry point now, before generating any
+# output or starting an expensive CEM arm. This catches incomplete runtime
+# dependencies in one deterministic preflight.
+from evals.simu_env_planning.eval import main as _run_native_eval
+
 if not torch.cuda.is_available():
     raise SystemExit("[STOP] CUDA is unavailable in the isolated evaluation environment")
 
@@ -111,6 +131,7 @@ print(f"[dependency preflight] Python={sys.version.split()[0]}")
 print(f"[dependency preflight] torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.get_device_name(0)}")
 print(f"[dependency preflight] gym={gym.__version__}")
 print(f"[dependency preflight] mujoco_py={mujoco_py.__version__}")
+print("[dependency preflight] native evaluation entry point=importable")
 print("[dependency preflight] PASS")
 PY
 IMPORT_RC=$?
@@ -122,7 +143,7 @@ if [ "$IMPORT_RC" -ne 0 ]; then
 fi
 
 printf '%s\n' \
-  "protocol=jepa_wm_native_pointmaze_eval_env_v1" \
+  "protocol=jepa_wm_native_pointmaze_eval_env_v2" \
   "python=$PYTHON_BIN" \
   "mujoco=$MUJOCO_ROOT" \
   > "$READY_STAMP"
