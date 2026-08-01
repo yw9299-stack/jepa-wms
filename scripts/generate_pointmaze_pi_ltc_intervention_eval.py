@@ -12,6 +12,7 @@ import torch
 import yaml
 
 from app.vjepa_wm.utils import build_plan_eval_args, clean_state_dict
+from src.utils.yaml_utils import convert_to_dict_recursive
 
 
 ARMS = {
@@ -87,7 +88,7 @@ def main():
 
     training = yaml.safe_load(args.training_config.read_text())
     output_root = args.checkpoint_dir / (
-        f"native_pointmaze_cem30_scale_{args.label}_seed{args.eval_seed}_ep{args.episodes}_v1"
+        f"native_pointmaze_cem30_scale_{args.label}_seed{args.eval_seed}_ep{args.episodes}_v2"
     )
     tag = "native_cem30_s300_k10_h6_nas6_ctxt2"
     protocol = {
@@ -192,8 +193,12 @@ def main():
         config["logging"]["save_episode_csv"] = True
         config["planner"]["decode_each_iteration"] = False
         config["task_specification"]["obs"] = "rgb_state"
+        config = convert_to_dict_recursive(config)
+        serialized = yaml.safe_dump(config, sort_keys=False)
+        if yaml.safe_load(serialized) != config:
+            raise SystemExit(f"[STOP] generated config failed YAML round-trip validation: arm={arm}")
         config_path = output_root / "configs" / f"{arm}.yaml"
-        config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+        config_path.write_text(serialized)
 
     print(f"[generated] {output_root}")
     print(f"[checkpoint] epoch={epoch} log_scale={log_scale:+.6f} scale={math.exp(log_scale):.6f}")

@@ -24,7 +24,7 @@ esac
 EVAL_SEED="${PI_LTC_EVAL_SEED:-1}"
 CHECKPOINT_DIR="${PI_LTC_JEPA_WM_CHECKPOINT_DIR:-/root/autodl-tmp/lewm_data/jepa_wms/pi_ltc_cross_model/pointmaze_jepa_wm_pi_ltc_5pass_seed3072}"
 CHECKPOINT="${PI_LTC_JEPA_WM_CHECKPOINT:-jepa-latest.pth.tar}"
-OUTPUT_ROOT="$CHECKPOINT_DIR/native_pointmaze_cem30_scale_${LABEL}_seed${EVAL_SEED}_ep${EPISODES}_v1"
+OUTPUT_ROOT="$CHECKPOINT_DIR/native_pointmaze_cem30_scale_${LABEL}_seed${EVAL_SEED}_ep${EPISODES}_v2"
 TAG=native_cem30_s300_k10_h6_nas6_ctxt2
 
 export PI_LTC_POINTMAZE_SOURCE="${PI_LTC_POINTMAZE_SOURCE:-/root/autodl-tmp/lewm_data/ogbench/temporal_pointmaze_medium_topdown.h5}"
