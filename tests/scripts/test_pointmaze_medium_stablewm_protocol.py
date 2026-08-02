@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_runner_uses_medium_stablewm_protocol_not_native_umaze():
     runner = (ROOT / "scripts/eval_pointmaze_medium_stablewm_protocol.py").read_text()
+    assert "sys.path.insert(0, str(REPOSITORY))" in runner
     assert 'config_name="pointmaze_topdown_medium"' in runner
     assert "ogbench/temporal_pointmaze_medium_topdown" in runner
     assert '"solver.n_steps=16"' in runner
@@ -36,6 +37,9 @@ def test_launcher_covers_pi_interventions_and_matched_vanilla():
         assert invocation in launcher
     assert "training=false" in launcher
     assert "native_pointmaze" not in launcher
+    assert 'export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"' in launcher
+    assert "elif ! run_arm identity pi" in launcher
+    assert "|| FAILED=$((FAILED + 1))" not in launcher
 
 
 def test_adapter_costs_visual_endpoint_and_preserves_proprio_conditioning():

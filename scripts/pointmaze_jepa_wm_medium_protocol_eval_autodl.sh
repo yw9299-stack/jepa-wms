@@ -5,6 +5,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
@@ -254,11 +255,17 @@ run_arm() {
 }
 
 FAILED=0
-run_arm learned pi "$PI_DIR" || FAILED=$((FAILED + 1))
-run_arm identity pi "$PI_DIR" || FAILED=$((FAILED + 1))
-run_arm fixed06 pi "$PI_DIR" || FAILED=$((FAILED + 1))
-run_arm fixed04 pi "$PI_DIR" || FAILED=$((FAILED + 1))
-run_arm vanilla_5pass vanilla "$VANILLA_DIR" || FAILED=$((FAILED + 1))
+if ! run_arm learned pi "$PI_DIR"; then
+    FAILED=1
+elif ! run_arm identity pi "$PI_DIR"; then
+    FAILED=1
+elif ! run_arm fixed06 pi "$PI_DIR"; then
+    FAILED=1
+elif ! run_arm fixed04 pi "$PI_DIR"; then
+    FAILED=1
+elif ! run_arm vanilla_5pass vanilla "$VANILLA_DIR"; then
+    FAILED=1
+fi
 
 SUMMARY_STATUS=1
 if [ "$FAILED" -eq 0 ]; then

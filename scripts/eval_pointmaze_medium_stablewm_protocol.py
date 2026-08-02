@@ -17,6 +17,12 @@ import torch
 import yaml
 from hydra import compose, initialize_config_dir
 
+# Direct execution sets sys.path[0] to scripts/, so make the repository's
+# top-level app package importable without relying on the caller's environment.
+REPOSITORY = Path(__file__).resolve().parents[1]
+if str(REPOSITORY) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY))
+
 from app.vjepa_wm.modelcustom.stablewm_pointmaze_cost import (
     build_stablewm_pointmaze_cost,
 )
@@ -101,7 +107,7 @@ def main() -> int:
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    repository = Path(__file__).resolve().parents[1]
+    repository = REPOSITORY
     lewm_repo = args.lewm_repo.resolve()
     source_h5 = args.source_h5.resolve()
     training_config_path = args.training_config.resolve()
