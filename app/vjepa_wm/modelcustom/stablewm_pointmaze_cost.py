@@ -57,19 +57,33 @@ def _repeat_latent_for_candidates(latent, samples: int):
 class StableWMPointMazeCost(torch.nn.Module):
     """Expose a JEPA-WM predictor through ``get_cost(info, candidates)``."""
 
-    def __init__(self, model, *, source_metadata: StableWMH5Metadata, arm: str, owner: str):
+    def __init__(
+        self,
+        model,
+        *,
+        source_metadata: StableWMH5Metadata,
+        arm: str,
+        owner: str,
+        candidate_chunk_size: int,
+    ):
         super().__init__()
+        if int(candidate_chunk_size) <= 0:
+            raise ValueError("candidate_chunk_size must be positive")
         self.model = model
         self.source_metadata = source_metadata
         self.arm = str(arm)
         self.owner = str(owner)
         self.context_cost_weight = 1.0
+        self.candidate_chunk_size = int(candidate_chunk_size)
         self.planner_scale_audit = getattr(model, "planner_scale_audit", None)
         self._encoding_cache_key = None
         self._encoding_cache_value = None
         self._encoding_cache_inputs = None
         self._encoding_cache_hits = 0
         self._encoding_cache_misses = 0
+        self._cost_calls = 0
+        self._candidate_chunks = 0
+        self._max_flattened_candidate_batch = 0
 
     @property
     def action_mean(self):
@@ -93,6 +107,16 @@ class StableWMPointMazeCost(torch.nn.Module):
             "strategy": "same-expanded-observation tensor identity within one CEM population",
             "hits": self._encoding_cache_hits,
             "misses": self._encoding_cache_misses,
+        }
+
+    @property
+    def candidate_chunk_audit(self) -> dict:
+        return {
+            "strategy": "candidate/order-preserving contiguous slices; concatenate costs in original order",
+            "candidate_chunk_size": self.candidate_chunk_size,
+            "cost_calls": self._cost_calls,
+            "candidate_chunks": self._candidate_chunks,
+            "max_flattened_candidate_batch": self._max_flattened_candidate_batch,
         }
 
     @staticmethod
@@ -167,20 +191,53 @@ class StableWMPointMazeCost(torch.nn.Module):
                 proprio_expanded,
             )
             self._encoding_cache_misses += 1
-        context_latent = _repeat_latent_for_candidates(context_latent, samples)
-        actions = rearrange(action_candidates, "b s t a -> t (b s) a")
-        predicted = self.model.unroll(context_latent, actions)
-        predicted_visual = predicted["visual"] if isinstance(predicted, (TensorDict, dict)) else predicted
-        predicted_final = predicted_visual[-1]
+        goal_final_base = goal_latent[:, -1]
+        cost_chunks = []
+        self._cost_calls += 1
+        for sample_start in range(0, samples, self.candidate_chunk_size):
+            sample_stop = min(samples, sample_start + self.candidate_chunk_size)
+            chunk_samples = sample_stop - sample_start
+            flattened_batch = batch * chunk_samples
+            self._candidate_chunks += 1
+            self._max_flattened_candidate_batch = max(
+                self._max_flattened_candidate_batch,
+                flattened_batch,
+            )
 
-        goal_final = goal_latent[:, -1]
-        goal_final = goal_final.unsqueeze(1).expand(batch, samples, *goal_final.shape[1:])
-        goal_final = goal_final.reshape(batch * samples, *goal_final.shape[2:])
-        if predicted_final.shape != goal_final.shape:
-            raise ValueError(f"predicted/goal latent shape mismatch: {predicted_final.shape} vs {goal_final.shape}")
+            context_chunk = _repeat_latent_for_candidates(context_latent, chunk_samples)
+            action_chunk = action_candidates[:, sample_start:sample_stop]
+            actions = rearrange(action_chunk, "b s t a -> t (b s) a")
+            predicted = self.model.unroll(context_chunk, actions)
+            predicted_visual = predicted["visual"] if isinstance(predicted, (TensorDict, dict)) else predicted
+            predicted_final = predicted_visual[-1]
 
-        costs = (predicted_final.float() - goal_final.float()).square().flatten(1).sum(dim=1)
-        costs = costs.reshape(batch, samples)
+            goal_chunk = goal_final_base.unsqueeze(1).expand(
+                batch,
+                chunk_samples,
+                *goal_final_base.shape[1:],
+            )
+            goal_chunk = goal_chunk.reshape(flattened_batch, *goal_final_base.shape[1:])
+            if predicted_final.shape != goal_chunk.shape:
+                raise ValueError(
+                    "predicted/goal latent shape mismatch: " f"{predicted_final.shape} vs {goal_chunk.shape}"
+                )
+
+            chunk_cost = (predicted_final.float() - goal_chunk.float()).square().flatten(1).sum(dim=1)
+            cost_chunks.append(chunk_cost.reshape(batch, chunk_samples))
+            # Release the complete six-step rollout before constructing the
+            # next chunk so the CUDA allocator can reuse those blocks.
+            del (
+                context_chunk,
+                action_chunk,
+                actions,
+                predicted,
+                predicted_visual,
+                predicted_final,
+                goal_chunk,
+                chunk_cost,
+            )
+
+        costs = torch.cat(cost_chunks, dim=1)
         if not torch.isfinite(costs).all():
             raise FloatingPointError("JEPA-WM planner produced non-finite candidate costs")
         return costs
@@ -194,6 +251,7 @@ def build_stablewm_pointmaze_cost(
     source_h5: str | Path,
     arm: str,
     owner: str,
+    candidate_chunk_size: int = 32,
     device: str | torch.device = "cuda",
 ) -> StableWMPointMazeCost:
     """Load either the PI or matched-vanilla checkpoint for Medium planning."""
@@ -257,4 +315,5 @@ def build_stablewm_pointmaze_cost(
         source_metadata=metadata,
         arm=arm,
         owner=owner,
+        candidate_chunk_size=candidate_chunk_size,
     ).eval()

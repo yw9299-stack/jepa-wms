@@ -22,6 +22,9 @@ def test_runner_uses_medium_stablewm_protocol_not_native_umaze():
     assert '"plan_config.horizon=6"' in runner
     assert '"plan_config.receding_horizon=6"' in runner
     assert '"plan_config.action_block=5"' in runner
+    assert 'parser.add_argument("--candidate-chunk-size", type=int, default=32)' in runner
+    assert "chunked_vs_single_batch_max_abs_error" in runner
+    assert "torch.allclose(single_batch_costs, chunked_costs" in runner
     assert '"eval.pi_ltc_scale_intervention_mode=none"' not in runner
     assert "maze-base" not in runner
 
@@ -41,6 +44,8 @@ def test_launcher_covers_pi_interventions_and_matched_vanilla():
     assert 'export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"' in launcher
     assert "evaluator import preflight failed" in launcher
     assert "eval_pointmaze_medium_stablewm_protocol.py --help" in launcher
+    assert 'CANDIDATE_CHUNK_SIZE="${CANDIDATE_CHUNK_SIZE:-32}"' in launcher
+    assert '--candidate-chunk-size "$CANDIDATE_CHUNK_SIZE"' in launcher
     assert "elif ! run_arm identity pi" in launcher
     assert "|| FAILED=$((FAILED + 1))" not in launcher
 
@@ -52,6 +57,9 @@ def test_adapter_costs_visual_endpoint_and_preserves_proprio_conditioning():
     assert ".square().flatten(1).sum(dim=1)" in adapter
     assert "action_candidates" in adapter
     assert "encoding_cache_audit" in adapter
+    assert "for sample_start in range(0, samples, self.candidate_chunk_size)" in adapter
+    assert "costs = torch.cat(cost_chunks, dim=1)" in adapter
+    assert "candidate_chunk_audit" in adapter
 
 
 def test_paired_statistics_are_exact_for_simple_cases():

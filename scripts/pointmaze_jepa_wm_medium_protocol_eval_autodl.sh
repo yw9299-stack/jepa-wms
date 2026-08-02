@@ -23,6 +23,7 @@ EPISODES="${EPISODES:-50}"
 OUT_ROOT="${OUT_ROOT:-$STABLEWM_HOME/jepa_wms/pi_ltc_cross_model/pointmaze_medium_stablewm_protocol_cem16_seed${EVAL_SEED}}"
 BOOTSTRAP_SAMPLES="${BOOTSTRAP_SAMPLES:-100000}"
 BOOTSTRAP_SEED="${BOOTSTRAP_SEED:-20260802}"
+CANDIDATE_CHUNK_SIZE="${CANDIDATE_CHUNK_SIZE:-32}"
 
 for required in \
     "$PYTHON_BIN" \
@@ -54,7 +55,8 @@ mkdir -p "$OUT_ROOT"
     "$TRAINING_CONFIG" \
     "$LEWM_REPO" \
     "$EVAL_SEED" \
-    "$EPISODES" <<'PY'
+    "$EPISODES" \
+    "$CANDIDATE_CHUNK_SIZE" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -70,6 +72,7 @@ import sys
     lewm_text,
     seed_text,
     episodes_text,
+    candidate_chunk_size_text,
 ) = sys.argv[1:]
 root = Path(root_text).resolve()
 source = Path(source_text).resolve()
@@ -111,6 +114,8 @@ evaluation = {
     "render_transform": "flip_ud",
     "success_threshold": 0.5,
     "cost": "visual latent squared L2 endpoint",
+    "candidate_chunk_size": int(candidate_chunk_size_text),
+    "candidate_chunking": "inference-only candidate/order-preserving contiguous slices",
 }
 manifest = {
     "schema_version": 1,
@@ -177,7 +182,7 @@ echo "training=false"
 echo "source=$SOURCE_H5"
 echo "PI=$PI_DIR/$CHECKPOINT"
 echo "vanilla=$VANILLA_DIR/$CHECKPOINT"
-echo "protocol: seed=$EVAL_SEED episodes=$EPISODES H6/R6/block5 CEM16/256/64"
+echo "protocol: seed=$EVAL_SEED episodes=$EPISODES H6/R6/block5 CEM16/256/64 chunk=$CANDIDATE_CHUNK_SIZE"
 echo "arms: learned identity fixed06 fixed04 vanilla_5pass"
 echo "output=$OUT_ROOT"
 echo "================================================================"
@@ -254,6 +259,7 @@ run_arm() {
         --output-root "$OUT_ROOT" \
         --eval-seed "$EVAL_SEED" \
         --episodes "$EPISODES" \
+        --candidate-chunk-size "$CANDIDATE_CHUNK_SIZE" \
         2>&1 | tee "$arm_log"
     local status="${PIPESTATUS[0]}"
     echo "[arm returned] arm=$arm status=$status"

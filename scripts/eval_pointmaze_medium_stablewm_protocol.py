@@ -70,9 +70,24 @@ def _preflight_cost(model, source_h5: Path) -> dict:
     }
     candidates = torch.zeros(1, samples, 6, model.model.action_dim, device=model.model.device)
     candidates[:, 1:] = torch.randn_like(candidates[:, 1:])
-    costs = model.get_cost(info, candidates)
-    if costs.shape != (1, samples) or not torch.isfinite(costs).all():
-        raise RuntimeError(f"planner cost preflight failed: shape={costs.shape}, costs={costs}")
+    requested_chunk_size = model.candidate_chunk_size
+    try:
+        model.candidate_chunk_size = samples
+        single_batch_costs = model.get_cost(info, candidates)
+        model.candidate_chunk_size = 2
+        chunked_costs = model.get_cost(info, candidates)
+    finally:
+        model.candidate_chunk_size = requested_chunk_size
+    if single_batch_costs.shape != (1, samples) or not torch.isfinite(single_batch_costs).all():
+        raise RuntimeError(
+            "planner cost preflight failed: " f"shape={single_batch_costs.shape}, costs={single_batch_costs}"
+        )
+    chunk_max_abs_error = float((single_batch_costs - chunked_costs).abs().max().cpu())
+    if not torch.allclose(single_batch_costs, chunked_costs, rtol=1.0e-5, atol=1.0e-3):
+        raise RuntimeError(
+            "candidate chunking changes planner costs beyond floating-point tolerance: "
+            f"max_abs_error={chunk_max_abs_error}"
+        )
 
     action_mean = action.mean(axis=0)
     action_std = action.std(axis=0)
@@ -85,8 +100,10 @@ def _preflight_cost(model, source_h5: Path) -> dict:
         )
     return {
         "passed": True,
-        "candidate_cost_shape": list(costs.shape),
-        "candidate_costs": [float(value) for value in costs[0].cpu()],
+        "candidate_cost_shape": list(chunked_costs.shape),
+        "candidate_costs": [float(value) for value in chunked_costs[0].cpu()],
+        "candidate_chunk_size": requested_chunk_size,
+        "chunked_vs_single_batch_max_abs_error": chunk_max_abs_error,
         "action_mean_max_abs_error": mean_error,
         "action_std_max_abs_error": std_error,
     }
@@ -104,6 +121,7 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--eval-seed", type=int, default=42)
     parser.add_argument("--episodes", type=int, default=50)
+    parser.add_argument("--candidate-chunk-size", type=int, default=32)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -126,6 +144,8 @@ def main() -> int:
             raise SystemExit(f"[STOP] missing required input: {required}")
     if args.episodes <= 0:
         raise SystemExit("[STOP] episodes must be positive")
+    if args.candidate_chunk_size <= 0:
+        raise SystemExit("[STOP] candidate chunk size must be positive")
 
     training_config = yaml.safe_load(training_config_path.read_text(encoding="utf-8"))
     model = build_stablewm_pointmaze_cost(
@@ -135,6 +155,7 @@ def main() -> int:
         source_h5=source_h5,
         arm=args.arm,
         owner=args.owner,
+        candidate_chunk_size=args.candidate_chunk_size,
         device=args.device,
     ).to(args.device)
     preflight = _preflight_cost(model, source_h5)
@@ -259,6 +280,7 @@ def main() -> int:
         },
         "adapter_preflight": preflight,
         "encoding_cache_audit": model.encoding_cache_audit,
+        "candidate_chunk_audit": model.candidate_chunk_audit,
         "results": captured,
     }
     _write_json_atomic(arm_root / "arm_audit.json", audit)
