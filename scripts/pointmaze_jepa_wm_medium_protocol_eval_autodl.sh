@@ -9,6 +9,7 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export STABLEWM_HOME="${STABLEWM_HOME:-/root/autodl-tmp/lewm_data}"
 
 PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/bin/python}"

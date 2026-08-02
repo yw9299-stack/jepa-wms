@@ -42,6 +42,7 @@ def test_launcher_covers_pi_interventions_and_matched_vanilla():
     assert "training=false" in launcher
     assert "native_pointmaze" not in launcher
     assert 'export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"' in launcher
+    assert "expandable_segments:True" in launcher
     assert "evaluator import preflight failed" in launcher
     assert "eval_pointmaze_medium_stablewm_protocol.py --help" in launcher
     assert 'CANDIDATE_CHUNK_SIZE="${CANDIDATE_CHUNK_SIZE:-32}"' in launcher
