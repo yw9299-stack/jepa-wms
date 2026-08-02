@@ -39,6 +39,12 @@ for required in \
     fi
 done
 
+if ! "$PYTHON_BIN" scripts/eval_pointmaze_medium_stablewm_protocol.py --help >/dev/null; then
+    echo "[STOP] Medium-protocol evaluator import preflight failed"
+    echo "[terminal remains open]"
+    return 1 2>/dev/null || exit 1
+fi
+
 mkdir -p "$OUT_ROOT"
 "$PYTHON_BIN" - \
     "$OUT_ROOT" \
