@@ -22,6 +22,7 @@ def test_runner_uses_medium_stablewm_protocol_not_native_umaze():
     assert '"plan_config.horizon=6"' in runner
     assert '"plan_config.receding_horizon=6"' in runner
     assert '"plan_config.action_block=5"' in runner
+    assert '"eval.pi_ltc_scale_intervention_mode=none"' not in runner
     assert "maze-base" not in runner
 
 

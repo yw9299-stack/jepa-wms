@@ -185,7 +185,10 @@ def main() -> int:
         "eval.save_video=false",
         "eval.context_cost_weight=1.0",
         "eval.cost_mode=latent",
-        "eval.pi_ltc_scale_intervention_mode=none",
+        # The adapter already owns and audits the requested scale.  Do not add
+        # LEWM's optional intervention field here: older Medium configs omit
+        # that structured key, while eval_pointmaze_topdown defaults it to
+        # "none" via cfg.eval.get(...).
         "world.render_transform=flip_ud",
         "world.show_target=false",
         "world.coordinate_offset=[1.2,1.2]",
