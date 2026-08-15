@@ -321,6 +321,9 @@ def main(args, resume_preempt=False):
     if main_optimizer == "transition_model":
         num_epochs = cfgs_opt["transition_model"]["num_epochs"]
         ipe = cfgs_opt["transition_model"]["iterations_per_epoch"]
+        configured_optimizer_step_budget = cfgs_opt["transition_model"].get(
+            "total_optimizer_steps"
+        )
         gradient_accumulation_steps = int(cfgs_opt["transition_model"].get("gradient_accumulation_steps", 1))
         train_predictor = True
         train_heads_on_predictor = False
@@ -330,6 +333,7 @@ def main(args, resume_preempt=False):
         train_predictor = cfgs_opt["heads"]["train_predictor"]
         train_heads_on_predictor = cfgs_opt["heads"]["train_heads_on_predictor"]
         gradient_accumulation_steps = 1
+        configured_optimizer_step_budget = None
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
     if planner_identified_enabled and (main_optimizer != "transition_model" or train_heads):
@@ -526,15 +530,54 @@ def main(args, resume_preempt=False):
     optimizer_steps_per_epoch = int(ipe) // gradient_accumulation_steps
     if optimizer_steps_per_epoch < 1:
         raise ValueError("not enough microbatches for one optimizer step")
+    expected_optimizer_steps_per_epoch = (
+        cfgs_opt.get("transition_model", {}).get(
+            "expected_optimizer_steps_per_epoch"
+        )
+        if main_optimizer == "transition_model"
+        else None
+    )
+    if (
+        expected_optimizer_steps_per_epoch is not None
+        and optimizer_steps_per_epoch
+        != int(expected_optimizer_steps_per_epoch)
+    ):
+        raise ValueError(
+            "optimizer steps per physical pass differ from the pinned task "
+            f"schedule: actual={optimizer_steps_per_epoch}, "
+            f"expected={expected_optimizer_steps_per_epoch}"
+        )
     microbatches_per_epoch = optimizer_steps_per_epoch * gradient_accumulation_steps
     dropped_microbatches = int(ipe) - microbatches_per_epoch
     ipe = microbatches_per_epoch
+    natural_optimizer_steps = int(num_epochs) * optimizer_steps_per_epoch
+    exact_optimizer_step_budget = configured_optimizer_step_budget is not None
+    optimizer_step_budget = (
+        int(configured_optimizer_step_budget)
+        if exact_optimizer_step_budget
+        else natural_optimizer_steps
+    )
+    if optimizer_step_budget < 1:
+        raise ValueError("total_optimizer_steps must be positive")
+    if exact_optimizer_step_budget and not (
+        (int(num_epochs) - 1) * optimizer_steps_per_epoch
+        < optimizer_step_budget
+        <= natural_optimizer_steps
+    ):
+        raise ValueError(
+            "num_epochs must be the minimal driver horizon containing the exact "
+            "optimizer-step budget: "
+            f"epochs={num_epochs}, steps_per_epoch={optimizer_steps_per_epoch}, "
+            f"budget={optimizer_step_budget}"
+        )
+    training_microbatch_budget = optimizer_step_budget * gradient_accumulation_steps
     logger.info(
         "Training schedule: "
         f"loader_microbatches={_dlen}, used_microbatches={ipe}, "
         f"gradient_accumulation={gradient_accumulation_steps}, "
         f"optimizer_steps_per_epoch={optimizer_steps_per_epoch}, "
-        f"dropped_tail_microbatches={dropped_microbatches}"
+        f"dropped_tail_microbatches={dropped_microbatches}, "
+        f"optimizer_step_budget={optimizer_step_budget}"
     )
     logger.info(f"📊 Iterations per epoch: {ipe} (dataset size: {_dlen})")
     if canary_optimizer_steps:
@@ -678,6 +721,7 @@ def main(args, resume_preempt=False):
                 "microbatches_per_epoch": ipe,
                 "optimizer_step_in_epoch": optimizer_step_in_epoch,
                 "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+                "optimizer_step_budget": optimizer_step_budget,
                 "total_microbatch_step": epoch * ipe + microbatch_in_epoch,
                 "total_optimizer_step": (
                     epoch * optimizer_steps_per_epoch + optimizer_step_in_epoch
@@ -705,11 +749,15 @@ def main(args, resume_preempt=False):
                     log_dict.update(image_stats)
             if "loss" in log_dict.keys() and itr % log_freq == 0:
                 logger.info(
-                    "[epoch %d/%d | opt %d/%d | micro %d/%d | %.1f%%] "
+                    "[epoch %d/%d | global opt %d/%d | pass opt %d/%d | "
+                    "micro %d/%d | %.1f%%] "
                     "loss: %.3f | "
                     % (
                         epoch + 1,
                         num_epochs,
+                        epoch * optimizer_steps_per_epoch
+                        + optimizer_step_in_epoch,
+                        optimizer_step_budget,
                         optimizer_step_in_epoch,
                         optimizer_steps_per_epoch,
                         microbatch_in_epoch,
@@ -839,22 +887,34 @@ def main(args, resume_preempt=False):
         if sampling_scheduler_type == "linear":
             # linear decay from sampling_scheduler_start to sampling_scheduler_end
             rollout_sampling_scheduler = (
-                sampling_scheduler_start - i * (sampling_scheduler_start - sampling_scheduler_end) / (ipe * num_epochs)
-                for i in range(int(ipe * num_epochs) + 1)
+                sampling_scheduler_start
+                - i
+                * (sampling_scheduler_start - sampling_scheduler_end)
+                / training_microbatch_budget
+                for i in range(training_microbatch_budget + 1)
             )
         elif sampling_scheduler_type == "exponential":
             # exponential decay from sampling_scheduler_start to sampling_scheduler_end
             rollout_sampling_scheduler = (
                 sampling_scheduler_start
-                * (sampling_scheduler_end / sampling_scheduler_start) ** (i / (ipe * num_epochs))
-                for i in range(int(ipe * num_epochs) + 1)
+                * (sampling_scheduler_end / sampling_scheduler_start)
+                ** (i / training_microbatch_budget)
+                for i in range(training_microbatch_budget + 1)
             )
         elif sampling_scheduler_type == "sigmoid":
             rollout_sampling_scheduler = (
                 sampling_scheduler_start
                 + (sampling_scheduler_end - sampling_scheduler_start)
-                * (1 / (1 + np.exp(-10 * (i / (ipe * num_epochs) - 0.5))))
-                for i in range(int(ipe * num_epochs) + 1)
+                * (
+                    1
+                    / (
+                        1
+                        + np.exp(
+                            -10 * (i / training_microbatch_budget - 0.5)
+                        )
+                    )
+                )
+                for i in range(training_microbatch_budget + 1)
             )
     else:
         optimizer, scaler, scheduler, wd_scheduler, clip_grad, use_radamw = None, None, None, None, None, None
@@ -890,6 +950,7 @@ def main(args, resume_preempt=False):
             train_predictor=train_predictor,
             strict_resume=bool(strict_provenance and resume_latest),
             expected_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+            expected_optimizer_step_budget=optimizer_step_budget,
             expected_gradient_accumulation_steps=gradient_accumulation_steps,
             expected_training_provenance=training_provenance,
             expected_common_trainable_initialization_sha256=(
@@ -1013,9 +1074,18 @@ def main(args, resume_preempt=False):
     # -- Initialize LPIPS once for evaluation
     lpips = lpips_lib.LPIPS(net="vgg").eval().to(device)
 
-    def save_checkpoint(epoch, path):
+    def save_checkpoint(
+        epoch,
+        path,
+        *,
+        total_optimizer_step_count=None,
+        optimizer_step_in_epoch=0,
+        training_complete=False,
+    ):
         if rank != 0:
             return
+        if total_optimizer_step_count is None:
+            total_optimizer_step_count = int(epoch) * optimizer_steps_per_epoch
         save_dict = {
             "predictor": world_model.predictor.state_dict() if world_model.predictor is not None else None,
             "opt": optimizer.state_dict() if optimizer is not None else None,
@@ -1024,7 +1094,10 @@ def main(args, resume_preempt=False):
             "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "planner_identified": (dict(cfgs_planner_identified) if planner_identified_enabled else None),
-            "total_optimizer_steps": int(epoch) * optimizer_steps_per_epoch,
+            "total_optimizer_steps": int(total_optimizer_step_count),
+            "optimizer_step_in_epoch": int(optimizer_step_in_epoch),
+            "optimizer_step_budget": optimizer_step_budget,
+            "training_complete": bool(training_complete),
             "training_provenance": training_provenance,
             "common_trainable_initialization_sha256": (
                 common_trainable_initialization_sha256
@@ -1154,6 +1227,7 @@ def main(args, resume_preempt=False):
     # -- TRAINING LOOP
     if not (plan_only_eval_mode or unroll_decode_eval_only_mode):
         canary_complete = False
+        step_budget_complete = False
         canary_valid_fraction_meter = AverageMeter()
         canary_landscape_loss_meter = AverageMeter()
         canary_sign_accuracy_meter = AverageMeter()
@@ -1834,13 +1908,18 @@ def main(args, resume_preempt=False):
                         train_csv_logger.log(*log_values)
                         if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                             logger.info(
-                                "[epoch %d/%d | opt %d/%d | micro %d/%d | %.1f%%] "
+                                "[epoch %d/%d | global opt %d/%d | "
+                                "pass opt %d/%d | micro %d/%d | %.1f%%] "
                                 "[mem: %.2e] "
                                 "[gpu: %.1f ms]"
                                 "[wall: %.1f ms]"
                                 % (
                                     epoch + 1,
                                     num_epochs,
+                                    epoch * optimizer_steps_per_epoch
+                                    + (itr + 1)
+                                    // gradient_accumulation_steps,
+                                    optimizer_step_budget,
                                     (itr + 1) // gradient_accumulation_steps,
                                     optimizer_steps_per_epoch,
                                     itr + 1,
@@ -1873,6 +1952,15 @@ def main(args, resume_preempt=False):
                     >= canary_optimizer_steps
                 ):
                     canary_complete = True
+                    break
+                if (
+                    exact_optimizer_step_budget
+                    and (itr + 1) % gradient_accumulation_steps == 0
+                    and epoch * optimizer_steps_per_epoch
+                    + (itr + 1) // gradient_accumulation_steps
+                    >= optimizer_step_budget
+                ):
+                    step_budget_complete = True
                     break
             logger.info("avg. loss %.3f" % loss_meter.avg)
 
@@ -1945,15 +2033,97 @@ def main(args, resume_preempt=False):
                     logger.info(f"[CANARY COMPLETE] summary={summary_path}")
                 break
 
+            if step_budget_complete:
+                completed_full_passes, optimizer_step_in_partial_pass = divmod(
+                    optimizer_step_budget,
+                    optimizer_steps_per_epoch,
+                )
+                if rank == 0:
+                    save_checkpoint(
+                        completed_full_passes,
+                        latest_path,
+                        total_optimizer_step_count=optimizer_step_budget,
+                        optimizer_step_in_epoch=optimizer_step_in_partial_pass,
+                        training_complete=True,
+                    )
+                    step_file = pref_tag + f"step{optimizer_step_budget}.{latest_format}"
+                    step_path = os.path.join(checkpoint_folder, step_file)
+                    save_checkpoint(
+                        completed_full_passes,
+                        step_path,
+                        total_optimizer_step_count=optimizer_step_budget,
+                        optimizer_step_in_epoch=optimizer_step_in_partial_pass,
+                        training_complete=True,
+                    )
+                    scale = (
+                        planner_input_scale(world_model)
+                        if planner_identified_enabled
+                        else None
+                    )
+                    summary = {
+                        "status": "TRAINING_COMPLETE",
+                        "optimizer_steps": optimizer_step_budget,
+                        "optimizer_steps_per_pass": optimizer_steps_per_epoch,
+                        "completed_full_passes": completed_full_passes,
+                        "optimizer_steps_in_partial_pass": (
+                            optimizer_step_in_partial_pass
+                        ),
+                        "gradient_accumulation_steps": (
+                            gradient_accumulation_steps
+                        ),
+                        "final_log_scale": (
+                            float(scale.log_scale.detach().cpu())
+                            if scale is not None
+                            else None
+                        ),
+                        "final_scale": (
+                            float(scale.input_scale.detach().cpu())
+                            if scale is not None
+                            else None
+                        ),
+                        "repository_commit": (
+                            training_provenance.get("repository_commit")
+                            if training_provenance is not None
+                            else None
+                        ),
+                    }
+                    summary_path = Path(folder) / "training_summary.json"
+                    temporary_path = summary_path.with_suffix(".json.tmp")
+                    temporary_path.write_text(
+                        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    temporary_path.replace(summary_path)
+                    logger.info(
+                        "[STEP BUDGET COMPLETE] "
+                        f"optimizer_steps={optimizer_step_budget} "
+                        f"summary={summary_path}"
+                    )
+                break
+
             # -- Save Last
             if not light_eval_only_mode:
                 if epoch % checkpoint_freq == 0 or epoch == (num_epochs - 1):
                     if rank == 0:
-                        save_checkpoint(epoch + 1, latest_path)
+                        save_checkpoint(
+                            epoch + 1,
+                            latest_path,
+                            training_complete=(
+                                not exact_optimizer_step_budget
+                                and epoch == num_epochs - 1
+                            ),
+                        )
                         if save_every_freq > 0 and epoch % save_every_freq == 0:
                             save_every_file = pref_tag + f"e{epoch}.{latest_format}"
                             save_every_path = os.path.join(checkpoint_folder, save_every_file)
-                            save_checkpoint(epoch + 1, save_every_path)
+                            save_checkpoint(
+                                epoch + 1,
+                                save_every_path,
+                                training_complete=(
+                                    not exact_optimizer_step_budget
+                                    and epoch == num_epochs - 1
+                                ),
+                            )
 
             # -- Launch Planning Eval
             if not light_eval_only_mode and not skip_planning_eval:

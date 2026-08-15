@@ -51,8 +51,11 @@ if [ "$TASK" = pusht ]; then
   SIDECAR="$PI_LTC_PUSHT_SIDECAR"
   EXPECTED_SOURCE_BYTES=46300921856
   EXPECTED_SIDECAR_BYTES=192116437
-  PI_RUN="pusht_jepa_wm_pi_ltc_5pass_v3_seed3072"
-  VANILLA_RUN="pusht_jepa_wm_vanilla_5pass_v3_seed3072"
+  PI_RUN="pusht_jepa_wm_pi_ltc_step111464_v4_seed3072"
+  VANILLA_RUN="pusht_jepa_wm_vanilla_step111464_v4_seed3072"
+  OPTIMIZER_STEP_BUDGET=111464
+  LEWM_REFERENCE_PASSES=8
+  DRIVER_EPOCHS=9
 else
   export PI_LTC_CUBE_SOURCE="${PI_LTC_CUBE_SOURCE:-/root/autodl-tmp/lewm_data/ogbench/cube_single_expert.h5}"
   export PI_LTC_CUBE_SIDECAR="${PI_LTC_CUBE_SIDECAR:-/root/autodl-tmp/lewm_data/ogbench/cube_counterfactual_cem0_seed3072.h5}"
@@ -60,9 +63,14 @@ else
   SIDECAR="$PI_LTC_CUBE_SIDECAR"
   EXPECTED_SOURCE_BYTES=101942558720
   EXPECTED_SIDECAR_BYTES=1282198884
-  PI_RUN="cube_jepa_wm_pi_ltc_5pass_v3_seed3072"
-  VANILLA_RUN="cube_jepa_wm_vanilla_5pass_v3_seed3072"
+  PI_RUN="cube_jepa_wm_pi_ltc_step51184_v4_seed3072"
+  VANILLA_RUN="cube_jepa_wm_vanilla_step51184_v4_seed3072"
+  OPTIMIZER_STEP_BUDGET=51184
+  LEWM_REFERENCE_PASSES=4
+  DRIVER_EPOCHS=4
 fi
+
+echo "[LEWM-step-matched schedule] task=$TASK reference_passes=$LEWM_REFERENCE_PASSES optimizer_steps=$OPTIMIZER_STEP_BUDGET driver_epochs=$DRIVER_EPOCHS"
 
 if [ "$NO_FILE_SCAN" = 1 ]; then
   # SHA-256 of the literal marker, not of either data file.  Provenance records
@@ -183,7 +191,7 @@ if [ "$TASK" = pusht ]; then
 fi
 
 SMOKE_ROOT="$PREFLIGHT_DIR/evaluator"
-for smoke_arm in learned vanilla_5pass; do
+for smoke_arm in learned vanilla_stepmatched; do
   if [ "$smoke_arm" = learned ]; then
     smoke_owner=pi
     smoke_config="$PI_CONFIG"
@@ -278,11 +286,26 @@ fi
 LATEST="$RUN_DIR/jepa-latest.pth.tar"
 
 checkpoint_status() {
-  python - "$LATEST" "$OWNER" "$EXPECTED_COMMIT" "$SOURCE_SHA" "$SIDECAR_SHA" "$DATA_AUDIT" "$NO_FILE_SCAN" "$PI_LTC_CONTENT_HASH_MODE" <<'PY'
+  python - "$LATEST" "$OWNER" "$EXPECTED_COMMIT" "$SOURCE_SHA" "$SIDECAR_SHA" "$DATA_AUDIT" "$NO_FILE_SCAN" "$PI_LTC_CONTENT_HASH_MODE" "$OPTIMIZER_STEP_BUDGET" "$LEWM_REFERENCE_PASSES" "$DRIVER_EPOCHS" <<'PY'
 import json, sys
 from pathlib import Path
 import torch
-path, owner, commit, source_sha, sidecar_sha, audit_path, no_file_scan, hash_mode = sys.argv[1:]
+(
+    path,
+    owner,
+    commit,
+    source_sha,
+    sidecar_sha,
+    audit_path,
+    no_file_scan,
+    hash_mode,
+    budget_text,
+    reference_passes_text,
+    driver_epochs_text,
+) = sys.argv[1:]
+budget = int(budget_text)
+reference_passes = int(reference_passes_text)
+driver_epochs = int(driver_epochs_text)
 path = Path(path)
 if not path.is_file():
     raise SystemExit(1)
@@ -313,13 +336,36 @@ if (
 ):
     raise SystemExit(2)
 epoch = int(checkpoint.get("epoch", -1))
-if epoch == 5:
-    if checkpoint.get("total_optimizer_steps") != 5 * steps:
+total_steps = int(checkpoint.get("total_optimizer_steps", -1))
+step_in_epoch = int(checkpoint.get("optimizer_step_in_epoch", 0))
+if checkpoint.get("optimizer_step_budget") != budget:
+    raise SystemExit(2)
+expected_full_passes, expected_tail_steps = divmod(budget, steps)
+if expected_full_passes != reference_passes:
+    raise SystemExit(2)
+if checkpoint.get("training_complete") is True:
+    if (
+        total_steps != budget
+        or epoch != expected_full_passes
+        or step_in_epoch != expected_tail_steps
+    ):
         raise SystemExit(2)
-    print(f"[complete checkpoint] epoch={epoch} steps={5 * steps} scale_keys={scale}")
+    print(
+        f"[complete checkpoint] lewm_reference_passes={reference_passes} "
+        f"full_jepa_passes={epoch} tail_steps={step_in_epoch} "
+        f"total_steps={total_steps} scale_keys={scale}"
+    )
     raise SystemExit(0)
-if 0 <= epoch < 5:
-    print(f"[strict resume] epoch={epoch} steps/pass={steps}")
+if (
+    0 <= epoch < driver_epochs
+    and step_in_epoch == 0
+    and total_steps == epoch * steps
+    and total_steps < budget
+):
+    print(
+        f"[strict resume] completed_passes={epoch} "
+        f"steps/pass={steps} total_steps={total_steps}/{budget}"
+    )
     raise SystemExit(1)
 raise SystemExit(2)
 PY

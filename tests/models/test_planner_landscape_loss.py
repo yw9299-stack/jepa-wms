@@ -18,9 +18,20 @@ from app.vjepa_wm.planner_landscape import (
     normalized_pairwise_landscape_error,
     pairwise_sign_accuracy,
 )
+from src.utils.schedulers import resolve_optimizer_schedule_steps
 
 
 class TestPlannerLandscapeLoss(unittest.TestCase):
+    def test_exact_optimizer_budget_owns_scheduler_horizon(self):
+        self.assertEqual(
+            resolve_optimizer_schedule_steps(9, 10, 83),
+            83,
+        )
+        self.assertEqual(
+            resolve_optimizer_schedule_steps(9, 10),
+            90,
+        )
+
     def test_matching_landscapes_have_zero_error_and_full_sign_accuracy(self):
         real = torch.tensor([[1.0, 3.0, 2.0], [5.0, 2.0, 7.0]])
         predicted = real.clone().requires_grad_(True)

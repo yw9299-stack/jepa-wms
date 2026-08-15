@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 from scripts.generate_stablewm_task_training_configs import TASKS, derive_task_configs
+from src.utils.schedulers import resolve_optimizer_schedule_steps
 
 
 class TestStableWmTaskTrainingProtocol(unittest.TestCase):
@@ -58,15 +59,71 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
                 restored["planner_identified"] = deepcopy(pi["planner_identified"])
                 self.assertEqual(restored, pi)
 
-    def test_five_pass_effective_batch_schedule_is_unchanged(self):
-        for task in TASKS:
+    def test_task_specific_lewm_step_budgets_use_effective_batch_128(self):
+        expected = {
+            "pusht": {
+                "steps": 111464,
+                "steps_per_pass": 13923,
+                "driver_epochs": 9,
+                "passes": 8,
+            },
+            "cube": {
+                "steps": 51184,
+                "steps_per_pass": 12796,
+                "driver_epochs": 4,
+                "passes": 4,
+            },
+        }
+        for task, spec in TASKS.items():
             with self.subTest(task=task):
                 pi, vanilla = derive_task_configs(self.base, task)
                 for config in (pi, vanilla):
                     optimization = config["optimization"]["transition_model"]
-                    self.assertEqual(optimization["num_epochs"], 5)
+                    self.assertEqual(
+                        optimization["num_epochs"],
+                        expected[task]["driver_epochs"],
+                    )
+                    self.assertEqual(
+                        optimization["total_optimizer_steps"],
+                        expected[task]["steps"],
+                    )
+                    self.assertEqual(
+                        optimization["expected_optimizer_steps_per_epoch"],
+                        expected[task]["steps_per_pass"],
+                    )
                     self.assertEqual(optimization["gradient_accumulation_steps"], 8)
                     self.assertEqual(config["data"]["loader"]["batch_size"], 16)
+                self.assertEqual(
+                    spec["lewm_reference_passes"],
+                    expected[task]["passes"],
+                )
+                self.assertIn(
+                    f"step{expected[task]['steps']}",
+                    spec["pi_run"],
+                )
+                full_passes, tail_steps = divmod(
+                    expected[task]["steps"],
+                    expected[task]["steps_per_pass"],
+                )
+                self.assertEqual(full_passes, expected[task]["passes"])
+                self.assertEqual(tail_steps, 80 if task == "pusht" else 0)
+
+    def test_optimizer_schedule_uses_exact_step_budget(self):
+        self.assertEqual(resolve_optimizer_schedule_steps(9, 13923, 111464), 111464)
+        self.assertEqual(resolve_optimizer_schedule_steps(4, 12796, 51184), 51184)
+        self.assertEqual(resolve_optimizer_schedule_steps(5, 10), 50)
+
+    def test_launch_and_evaluation_names_are_step_matched(self):
+        launcher = Path("scripts/stablewm_task_5pass_autodl.sh").read_text()
+        evaluator = Path("scripts/stablewm_task_eval_autodl.sh").read_text()
+        summary = Path("scripts/summarize_stablewm_task_multiseed.py").read_text()
+        self.assertIn("OPTIMIZER_STEP_BUDGET=111464", launcher)
+        self.assertIn("OPTIMIZER_STEP_BUDGET=51184", launcher)
+        self.assertIn("LEWM_REFERENCE_PASSES=8", launcher)
+        self.assertIn("LEWM_REFERENCE_PASSES=4", launcher)
+        self.assertIn("vanilla_stepmatched", launcher)
+        self.assertIn("vanilla_stepmatched", evaluator)
+        self.assertIn('"vanilla_stepmatched": "vanilla"', summary)
 
 
 if __name__ == "__main__":

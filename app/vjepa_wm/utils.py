@@ -17,7 +17,12 @@ from app.plan_common.models.dino import DinoEncoder
 from app.plan_common.models.prop_embedding import ProprioceptiveEmbedding
 from app.plan_common.models.vit import ViTPredictor
 from src.utils.adamw import AdamW as RAdamW
-from src.utils.schedulers import CosineWDSchedule, WarmupCosineSchedule, WSDSchedule
+from src.utils.schedulers import (
+    CosineWDSchedule,
+    WarmupCosineSchedule,
+    WSDSchedule,
+    resolve_optimizer_schedule_steps,
+)
 from src.utils.tensors import trunc_normal_
 from src.utils.yaml_utils import load_yaml
 
@@ -509,6 +514,7 @@ def load_checkpoint(
     train_heads=False,
     strict_resume=False,
     expected_optimizer_steps_per_epoch=None,
+    expected_optimizer_step_budget=None,
     expected_gradient_accumulation_steps=None,
     expected_training_provenance=None,
     expected_common_trainable_initialization_sha256=None,
@@ -541,6 +547,7 @@ def load_checkpoint(
     if strict_resume:
         for key, expected in (
             ("optimizer_steps_per_epoch", expected_optimizer_steps_per_epoch),
+            ("optimizer_step_budget", expected_optimizer_step_budget),
             ("gradient_accumulation_steps", expected_gradient_accumulation_steps),
         ):
             if expected is not None and checkpoint.get(key) != expected:
@@ -559,12 +566,20 @@ def load_checkpoint(
         ):
             raise RuntimeError("strict resume common initialization fingerprint differs")
         epoch = int(checkpoint.get("epoch", -1))
+        optimizer_step_in_epoch = int(
+            checkpoint.get("optimizer_step_in_epoch", 0)
+        )
         if (
             expected_optimizer_steps_per_epoch is not None
             and checkpoint.get("total_optimizer_steps")
             != epoch * int(expected_optimizer_steps_per_epoch)
+            + optimizer_step_in_epoch
         ):
             raise RuntimeError("strict resume total optimizer-step count differs")
+        if expected_optimizer_steps_per_epoch is not None and not (
+            0 <= optimizer_step_in_epoch < int(expected_optimizer_steps_per_epoch)
+        ):
+            raise RuntimeError("strict resume optimizer_step_in_epoch is invalid")
 
     (
         predictor,
@@ -906,6 +921,8 @@ def init_opt(
     ref_lr=1e-3,
     warmup=2,
     num_epochs=90,
+    total_optimizer_steps=None,
+    expected_optimizer_steps_per_epoch=None,
     freeze_encoder=True,
     use_radamw=False,
     weight_decay=1e-6,
@@ -1019,7 +1036,19 @@ def init_opt(
         optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
 
     warmup_steps = int(warmup * iterations_per_epoch)
-    T_max = int(ipe_scale * num_epochs * iterations_per_epoch)
+    if (
+        expected_optimizer_steps_per_epoch is not None
+        and int(expected_optimizer_steps_per_epoch) != int(iterations_per_epoch)
+    ):
+        raise ValueError(
+            "optimizer schedule steps/pass differ from the pinned task schedule"
+        )
+    schedule_optimizer_steps = resolve_optimizer_schedule_steps(
+        num_epochs,
+        iterations_per_epoch,
+        total_optimizer_steps,
+    )
+    T_max = int(ipe_scale * schedule_optimizer_steps)
     if use_wsd_schedule:
         # Use WSDSchedule (Warmup-Stable-Decay)
         # Default anneal_steps to warmup_steps

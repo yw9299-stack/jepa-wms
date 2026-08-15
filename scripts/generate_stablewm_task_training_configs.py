@@ -19,8 +19,13 @@ BASE_CONFIG = Path("configs/pi_ltc_cross_model/pointmaze_jepa_wm_pi_ltc_5pass.ya
 
 TASKS = {
     "pusht": {
-        "pi_run": "pusht_jepa_wm_pi_ltc_5pass_v3_seed3072",
-        "vanilla_run": "pusht_jepa_wm_vanilla_5pass_v3_seed3072",
+        "pi_run": "pusht_jepa_wm_pi_ltc_step111464_v4_seed3072",
+        "vanilla_run": "pusht_jepa_wm_vanilla_step111464_v4_seed3072",
+        "lewm_reference": "pusht_ltc_planner_identified_global_clean8p",
+        "lewm_reference_passes": 8,
+        "optimizer_step_budget": 111464,
+        "jepa_optimizer_steps_per_pass": 13923,
+        "driver_epochs": 9,
         "source_env": "PI_LTC_PUSHT_SOURCE",
         "sidecar_env": "PI_LTC_PUSHT_SIDECAR",
         "proprio_keys": ["proprio"],
@@ -35,8 +40,13 @@ TASKS = {
         "sidecar_config_sha256": "35b55bbd2cdfde01ae133fe86254dc720116885c69e31165bf3abdb08fc5659b",
     },
     "cube": {
-        "pi_run": "cube_jepa_wm_pi_ltc_5pass_v3_seed3072",
-        "vanilla_run": "cube_jepa_wm_vanilla_5pass_v3_seed3072",
+        "pi_run": "cube_jepa_wm_pi_ltc_step51184_v4_seed3072",
+        "vanilla_run": "cube_jepa_wm_vanilla_step51184_v4_seed3072",
+        "lewm_reference": "cube_ltc_planner_identified_global_step51184_clean4p",
+        "lewm_reference_passes": 4,
+        "optimizer_step_budget": 51184,
+        "jepa_optimizer_steps_per_pass": 12796,
+        "driver_epochs": 4,
         "source_env": "PI_LTC_CUBE_SOURCE",
         "sidecar_env": "PI_LTC_CUBE_SIDECAR",
         "proprio_keys": [
@@ -97,7 +107,12 @@ def derive_task_configs(base: dict, task: str) -> tuple[dict, dict]:
         or int(optimization["gradient_accumulation_steps"]) != 8
         or int(pi["data"]["loader"]["batch_size"]) != 16
     ):
-        raise ValueError("base config is not the canonical five-pass/effective-128 schedule")
+        raise ValueError("base config is not the audited effective-128 template")
+    optimization["num_epochs"] = spec["driver_epochs"]
+    optimization["total_optimizer_steps"] = spec["optimizer_step_budget"]
+    optimization["expected_optimizer_steps_per_epoch"] = spec[
+        "jepa_optimizer_steps_per_pass"
+    ]
 
     pi["folder"] = f"${{JEPAWM_LOGS}}/pi_ltc_cross_model/{spec['pi_run']}"
     pi["data"]["paths"] = [f"${{{spec['source_env']}}}"]
@@ -179,7 +194,7 @@ def main() -> int:
     spec = TASKS[args.task]
     manifest = {
         "schema_version": 1,
-        "protocol": f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_5pass_v3",
+        "protocol": f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_lewm_stepmatched_v4",
         "repository_commit": commit,
         "repository_tracked_dirty": dirty,
         "content_hash_mode": os.environ.get("PI_LTC_CONTENT_HASH_MODE", "sha256"),
@@ -195,11 +210,18 @@ def main() -> int:
             "planner_identified": ["task sidecar objective", {"enabled": False}],
         },
         "schedule": {
-            "passes": 5,
+            "lewm_reference": spec["lewm_reference"],
+            "lewm_reference_passes": spec["lewm_reference_passes"],
+            "optimizer_step_budget": spec["optimizer_step_budget"],
+            "jepa_optimizer_steps_per_pass": spec[
+                "jepa_optimizer_steps_per_pass"
+            ],
+            "driver_epochs": spec["driver_epochs"],
             "micro_batch": 16,
             "gradient_accumulation_steps": 8,
             "effective_batch": 128,
             "optimizer_steps_per_pass": "derived from the episode-level train split",
+            "completion": "exact optimizer-step budget, including a partial final pass when required",
         },
     }
     manifest_payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()

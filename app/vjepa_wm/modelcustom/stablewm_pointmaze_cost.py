@@ -306,8 +306,8 @@ def build_stablewm_pointmaze_cost(
         raise ValueError(f"owner must be pi or vanilla, got {owner!r}")
     if owner == "pi" and arm not in PI_SCALE_ARMS:
         raise ValueError(f"unknown PI scale arm {arm!r}")
-    if owner == "vanilla" and arm != "vanilla_5pass":
-        raise ValueError("vanilla owner requires arm=vanilla_5pass")
+    if owner == "vanilla" and arm not in {"vanilla_5pass", "vanilla_stepmatched"}:
+        raise ValueError("vanilla owner requires a matched vanilla arm")
 
     cfg_data = deepcopy(training_config["data"])
     cfg_data_aug = deepcopy(training_config["data_aug"])

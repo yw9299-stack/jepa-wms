@@ -179,11 +179,10 @@ def _checkpoint_audit(
     source_sha256: str,
     sidecar_sha256: str,
     expected_optimizer_steps_per_epoch: int,
+    expected_optimizer_step_budget: int,
     smoke: bool = False,
 ) -> dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if not smoke and int(checkpoint.get("epoch", -1)) != 5:
-        raise RuntimeError(f"checkpoint epoch={checkpoint.get('epoch')}, expected exactly 5")
     predictor = checkpoint.get("predictor") or {}
     scale_keys = [key for key in predictor if key.endswith("planner_input_scale.log_scale")]
     if owner == "pi" and len(scale_keys) != 1:
@@ -203,8 +202,20 @@ def _checkpoint_audit(
             raise RuntimeError("checkpoint sidecar SHA-256 differs")
         if checkpoint.get("optimizer_steps_per_epoch") != expected_optimizer_steps_per_epoch:
             raise RuntimeError("checkpoint optimizer-step schedule differs")
-        if checkpoint.get("total_optimizer_steps") != 5 * expected_optimizer_steps_per_epoch:
+        completed_passes, partial_pass_steps = divmod(
+            expected_optimizer_step_budget,
+            expected_optimizer_steps_per_epoch,
+        )
+        if checkpoint.get("optimizer_step_budget") != expected_optimizer_step_budget:
+            raise RuntimeError("checkpoint optimizer-step budget differs")
+        if checkpoint.get("total_optimizer_steps") != expected_optimizer_step_budget:
             raise RuntimeError("checkpoint total optimizer-step count differs")
+        if checkpoint.get("training_complete") is not True:
+            raise RuntimeError("checkpoint is not marked training-complete")
+        if int(checkpoint.get("epoch", -1)) != completed_passes:
+            raise RuntimeError("checkpoint completed-pass count differs")
+        if int(checkpoint.get("optimizer_step_in_epoch", -1)) != partial_pass_steps:
+            raise RuntimeError("checkpoint partial-pass optimizer-step count differs")
         if (
             not isinstance(initialization_sha256, str)
             or len(initialization_sha256) != 64
@@ -218,6 +229,9 @@ def _checkpoint_audit(
         "epoch": int(checkpoint["epoch"]),
         "optimizer_steps_per_epoch": int(checkpoint.get("optimizer_steps_per_epoch", 0)),
         "total_optimizer_steps": int(checkpoint.get("total_optimizer_steps", 0)),
+        "optimizer_step_budget": int(checkpoint.get("optimizer_step_budget", 0)),
+        "optimizer_step_in_epoch": int(checkpoint.get("optimizer_step_in_epoch", 0)),
+        "training_complete": checkpoint.get("training_complete") is True,
         "scale_keys": scale_keys,
         "training_provenance": provenance,
         "common_trainable_initialization_sha256": initialization_sha256,
@@ -250,8 +264,8 @@ def main() -> int:
 
     if args.owner == "pi" and args.arm not in {"learned", "identity", "fixed06", "fixed04"}:
         raise SystemExit("[STOP] invalid PI arm")
-    if args.owner == "vanilla" and args.arm != "vanilla_5pass":
-        raise SystemExit("[STOP] vanilla owner requires arm=vanilla_5pass")
+    if args.owner == "vanilla" and args.arm != "vanilla_stepmatched":
+        raise SystemExit("[STOP] vanilla owner requires arm=vanilla_stepmatched")
     if args.episodes != (1 if args.smoke else 50):
         raise SystemExit("[STOP] smoke requires 1 episode; exact evaluation requires 50")
     if args.candidate_chunk_size <= 0:
@@ -298,15 +312,27 @@ def main() -> int:
             "[STOP] data/training preflight audit or source-file state does not match evaluation"
         )
 
+    training_config = yaml.safe_load(training_config_path.read_text(encoding="utf-8"))
+    transition_optimization = training_config["optimization"]["transition_model"]
+    expected_optimizer_steps_per_epoch = int(
+        preflight_audit["split"]["optimizer_steps_per_pass"]
+    )
+    if (
+        int(transition_optimization["expected_optimizer_steps_per_epoch"])
+        != expected_optimizer_steps_per_epoch
+    ):
+        raise SystemExit("[STOP] training config optimizer steps/pass differs from preflight")
+    expected_optimizer_step_budget = int(
+        transition_optimization["total_optimizer_steps"]
+    )
     checkpoint_audit = _checkpoint_audit(
         checkpoint_path,
         owner=args.owner,
         expected_commit=args.expected_commit,
         source_sha256=args.source_sha256,
         sidecar_sha256=args.sidecar_sha256,
-        expected_optimizer_steps_per_epoch=int(
-            preflight_audit["split"]["optimizer_steps_per_pass"]
-        ),
+        expected_optimizer_steps_per_epoch=expected_optimizer_steps_per_epoch,
+        expected_optimizer_step_budget=expected_optimizer_step_budget,
         smoke=args.smoke,
     )
     arm_root = (
@@ -335,7 +361,6 @@ def main() -> int:
             print(f"[reuse complete] {existing_audit_path}")
             return 0
         raise SystemExit("[STOP] existing arm audit is not reusable; preserve and inspect it")
-    training_config = yaml.safe_load(training_config_path.read_text(encoding="utf-8"))
     model = build_stablewm_pointmaze_cost(
         checkpoint_dir=args.checkpoint_dir,
         checkpoint=args.checkpoint,

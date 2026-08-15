@@ -15,7 +15,7 @@ SEEDS = (42, 43, 44)
 REQUIRED_ARMS = {
     "learned": "pi",
     "identity": "pi",
-    "vanilla_5pass": "vanilla",
+    "vanilla_stepmatched": "vanilla",
 }
 EXACT_PROTOCOL = {
     "episodes": 50,
@@ -191,7 +191,7 @@ def summarize(root: Path, task: str, draws: int, bootstrap_seed: int) -> dict:
     for seed, arms in audits.items():
         learned_hash = arms["learned"]["checkpoint"]["sha256"]
         identity_hash = arms["identity"]["checkpoint"]["sha256"]
-        vanilla_hash = arms["vanilla_5pass"]["checkpoint"]["sha256"]
+        vanilla_hash = arms["vanilla_stepmatched"]["checkpoint"]["sha256"]
         if learned_hash != identity_hash:
             raise ValueError(f"seed {seed}: learned and identity are not the same checkpoint")
         if learned_hash == vanilla_hash:
@@ -199,7 +199,7 @@ def summarize(root: Path, task: str, draws: int, bootstrap_seed: int) -> dict:
         learned_initialization = arms["learned"]["checkpoint"].get(
             "common_trainable_initialization_sha256"
         )
-        vanilla_initialization = arms["vanilla_5pass"]["checkpoint"].get(
+        vanilla_initialization = arms["vanilla_stepmatched"]["checkpoint"].get(
             "common_trainable_initialization_sha256"
         )
         if (
@@ -220,8 +220,11 @@ def summarize(root: Path, task: str, draws: int, bootstrap_seed: int) -> dict:
     cross_checkpoint = _contrast(
         audits,
         left_arm="learned",
-        right_arm="vanilla_5pass",
-        estimand="B: five-pass PI checkpoint versus matched five-pass vanilla checkpoint",
+        right_arm="vanilla_stepmatched",
+        estimand=(
+            "B: task-specific LeWM-step-matched PI checkpoint versus matched "
+            "vanilla checkpoint"
+        ),
         draws=draws,
         bootstrap_seed=bootstrap_seed + 1,
     )

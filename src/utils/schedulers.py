@@ -8,6 +8,20 @@
 import math
 
 
+def resolve_optimizer_schedule_steps(
+    num_epochs,
+    iterations_per_epoch,
+    total_optimizer_steps=None,
+):
+    if total_optimizer_steps is None:
+        steps = int(num_epochs) * int(iterations_per_epoch)
+    else:
+        steps = int(total_optimizer_steps)
+    if steps < 1:
+        raise ValueError("optimizer schedule must contain at least one step")
+    return steps
+
+
 class WSDSchedule(object):
 
     def __init__(self, optimizer, warmup_steps, anneal_steps, T_max, start_lr, ref_lr, final_lr=0.0):

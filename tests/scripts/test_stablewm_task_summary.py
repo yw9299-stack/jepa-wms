@@ -17,7 +17,7 @@ class TestStableWmTaskSummary(unittest.TestCase):
             for arm, owner, outcomes, checkpoint in (
                 ("learned", "pi", learned, "pi-checkpoint"),
                 ("identity", "pi", identity, "pi-checkpoint"),
-                ("vanilla_5pass", "vanilla", vanilla, "vanilla-checkpoint"),
+                ("vanilla_stepmatched", "vanilla", vanilla, "vanilla-checkpoint"),
             ):
                 path = self.root / "pusht" / f"seed{seed}" / arm / "arm_audit.json"
                 path.parent.mkdir(parents=True)
