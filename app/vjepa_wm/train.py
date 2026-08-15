@@ -5,7 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import hashlib
 import os
+import random
+import subprocess
+from pathlib import Path
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -74,12 +78,40 @@ DEFAULT_EVAL_FREQ = 50
 # --
 
 _GLOBAL_SEED = 0
+random.seed(_GLOBAL_SEED)
 np.random.seed(_GLOBAL_SEED)
 torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
 
 logger = get_logger(__name__)
+
+
+def _common_trainable_initialization_sha256(
+    predictor,
+    action_encoder,
+    proprio_encoder,
+):
+    """Fingerprint matched trainable state while excluding PI's extra scalar."""
+
+    digest = hashlib.sha256()
+    for module_name, module in (
+        ("predictor", predictor),
+        ("action_encoder", action_encoder),
+        ("proprio_encoder", proprio_encoder),
+    ):
+        if module is None:
+            continue
+        for key, value in sorted(module.state_dict().items()):
+            if key.endswith("planner_input_scale.log_scale"):
+                continue
+            tensor = value.detach().cpu().contiguous()
+            digest.update(module_name.encode("utf-8"))
+            digest.update(key.encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("utf-8"))
+            digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+            digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
 
 
 def main(args, resume_preempt=False):
@@ -92,6 +124,7 @@ def main(args, resume_preempt=False):
     os.makedirs(checkpoint_folder, exist_ok=True)
     # -- META
     cfgs_meta = args.get("meta")
+    strict_provenance = bool(cfgs_meta.get("strict_provenance", False))
     load_model = cfgs_meta.get("load_checkpoint") or resume_preempt
     load_opt_scale_epoch = cfgs_meta.get("load_opt_scale_epoch", False)
     freeze_encoder = cfgs_meta.get("freeze_encoder", True)
@@ -223,6 +256,55 @@ def main(args, resume_preempt=False):
     cfgs_planner_identified = args.get("planner_identified", {})
     planner_identified_enabled = bool(cfgs_planner_identified.get("enabled", False))
 
+    training_provenance = None
+    if strict_provenance:
+        required_environment = (
+            "PI_LTC_REPOSITORY_COMMIT",
+            "PI_LTC_SOURCE_SHA256",
+            "PI_LTC_SIDECAR_SHA256",
+        )
+        missing_environment = [name for name in required_environment if not os.environ.get(name)]
+        if missing_environment:
+            raise ValueError(
+                "strict provenance requires environment variables: "
+                + ", ".join(missing_environment)
+            )
+        repository_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        repository_dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+                text=True,
+            ).strip()
+        )
+        if repository_commit != os.environ["PI_LTC_REPOSITORY_COMMIT"]:
+            raise ValueError("strict provenance repository commit differs from the launcher")
+        if repository_dirty:
+            raise ValueError("strict provenance requires a clean tracked worktree")
+        if dataset_type != "stablewm_h5" or len(dataset_paths) != 1:
+            raise ValueError("strict provenance requires exactly one StableWM HDF5 source")
+        source_path = Path(dataset_paths[0]).resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(source_path)
+        sidecar_value = cfgs_planner_identified.get("sidecar_h5")
+        sidecar_path = Path(sidecar_value).resolve() if sidecar_value else None
+        training_provenance = {
+            "repository_commit": repository_commit,
+            "repository_tracked_dirty": repository_dirty,
+            "source_h5": {
+                "path": str(source_path),
+                "bytes": source_path.stat().st_size,
+                "sha256": os.environ["PI_LTC_SOURCE_SHA256"],
+            },
+            "sidecar_h5": {
+                "path": str(sidecar_path) if sidecar_path is not None else None,
+                "bytes": sidecar_path.stat().st_size if sidecar_path is not None else None,
+                "sha256": os.environ["PI_LTC_SIDECAR_SHA256"],
+            },
+            "resolved_config": convert_to_dict_recursive(args),
+        }
+
     main_optimizer = cfgs_opt["main_optimizer"]
     if main_optimizer == "transition_model":
         num_epochs = cfgs_opt["transition_model"]["num_epochs"]
@@ -255,6 +337,7 @@ def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
     # ----------------------------------------------------------------------- #
 
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.backends.cudnn.benchmark = True
@@ -468,7 +551,15 @@ def main(args, resume_preempt=False):
             action_std=traj_dataset.action_std,
             proprio_mean=traj_dataset.proprio_mean,
             proprio_std=traj_dataset.proprio_std,
+            source_metadata=traj_dataset,
             expected_protocol=cfgs_planner_identified.get("expected_protocol", "pointmaze_planner_counterfactual_v1"),
+            expected_groups=cfgs_planner_identified.get("expected_groups"),
+            expected_branches_per_group=cfgs_planner_identified.get(
+                "expected_branches_per_group"
+            ),
+            expected_config_sha256=cfgs_planner_identified.get(
+                "expected_config_sha256"
+            ),
             frameskip=frameskip,
             goal_offset_steps=cfgs_planner_identified.get("goal_offset_steps", 25),
         )
@@ -626,7 +717,24 @@ def main(args, resume_preempt=False):
             "use_action": use_action,  # Computed derived value
         }
     )
+    # Dataset/planner construction differs between PI-LTC and vanilla.  Reset the
+    # model-initialization RNG boundary so those setup paths cannot perturb the
+    # common predictor/encoder initialization used by the matched comparison.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     predictor, encoder, action_encoder, proprio_encoder = init_video_model(**model_kwargs)
+    common_trainable_initialization_sha256 = _common_trainable_initialization_sha256(
+        predictor,
+        action_encoder,
+        proprio_encoder,
+    )
+    logger.info(
+        "Common trainable initialization SHA-256: "
+        f"{common_trainable_initialization_sha256}"
+    )
 
     heads = {}
     if train_heads or pretrain_dec_path is not None:
@@ -715,6 +823,13 @@ def main(args, resume_preempt=False):
             load_heads=load_heads,
             train_heads=train_heads,
             train_predictor=train_predictor,
+            strict_resume=bool(strict_provenance and resume_latest),
+            expected_optimizer_steps_per_epoch=optimizer_steps_per_epoch,
+            expected_gradient_accumulation_steps=gradient_accumulation_steps,
+            expected_training_provenance=training_provenance,
+            expected_common_trainable_initialization_sha256=(
+                common_trainable_initialization_sha256
+            ),
         )
         # Only resume the schedulers if we resume a pretraining or a finetuning
         # Not if we start a finetuning: we reset them
@@ -832,6 +947,11 @@ def main(args, resume_preempt=False):
             "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "planner_identified": (dict(cfgs_planner_identified) if planner_identified_enabled else None),
+            "total_optimizer_steps": int(epoch) * optimizer_steps_per_epoch,
+            "training_provenance": training_provenance,
+            "common_trainable_initialization_sha256": (
+                common_trainable_initialization_sha256
+            ),
         }
         if world_model.action_encoder is not None and not cfgs_model["action_encoder"].get(
             "action_encoder_inpred", False
@@ -847,10 +967,14 @@ def main(args, resume_preempt=False):
             for name, head in world_model.heads.items():
                 head_path = path.removesuffix(".pth.tar") + "_" + name + ".pth.tar"
                 head.save_checkpoint(epoch, head_path)
+        temporary_path = f"{path}.tmp"
         try:
-            torch.save(save_dict, path)
-        except Exception as e:
-            logger.info(f"Encountered exception when saving checkpoint: {e}")
+            torch.save(save_dict, temporary_path)
+            os.replace(temporary_path, path)
+        except Exception:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+            raise
 
     logger.info("Initializing loader...")
     train_loader = iter(unsupervised_loader)

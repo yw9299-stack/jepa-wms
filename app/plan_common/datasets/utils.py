@@ -34,6 +34,12 @@ def init_data(
     frameskip=None,
     action_skip=1,
     normalize_action=True,  # normalized both action and proprio when building TrajDataset
+    proprio_keys=None,
+    expected_action_dim=None,
+    expected_proprio_dim=None,
+    expected_row_count=None,
+    expected_episode_count=None,
+    expected_total_clips=None,
     traj_subset=True,
     filter_first_episodes=100,
     filter_tasks=None,
@@ -93,6 +99,12 @@ def init_data(
             frameskip=frameskip,
             action_skip=action_skip,
             random_seed=seed,
+            proprio_keys=proprio_keys,
+            expected_action_dim=expected_action_dim,
+            expected_proprio_dim=expected_proprio_dim,
+            expected_row_count=expected_row_count,
+            expected_episode_count=expected_episode_count,
+            expected_total_clips=expected_total_clips,
         )
         dataset = datasets["train"]
         # DistributedSampler.set_epoch() supplies a new deterministic ordering

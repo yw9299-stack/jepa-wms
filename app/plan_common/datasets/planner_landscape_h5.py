@@ -16,6 +16,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Subset
 
+from .stablewm_h5_dset import StableWMH5Metadata
+
 POINTMAZE_PROTOCOL = "pointmaze_planner_counterfactual_v1"
 
 
@@ -30,7 +32,12 @@ class PlannerLandscapeH5Dataset(Dataset):
         action_std,
         proprio_mean,
         proprio_std,
+        source_metadata: StableWMH5Metadata | None = None,
+        proprio_keys=None,
         expected_protocol=POINTMAZE_PROTOCOL,
+        expected_groups=None,
+        expected_branches_per_group=None,
+        expected_config_sha256=None,
         frameskip=5,
         goal_offset_steps=25,
     ):
@@ -43,6 +50,13 @@ class PlannerLandscapeH5Dataset(Dataset):
         self.action_std = torch.as_tensor(action_std, dtype=torch.float32)
         self.proprio_mean = torch.as_tensor(proprio_mean, dtype=torch.float32)
         self.proprio_std = torch.as_tensor(proprio_std, dtype=torch.float32)
+        self.source_metadata = source_metadata or StableWMH5Metadata(
+            self.source_h5_path,
+            normalize_action=False,
+            proprio_keys=proprio_keys,
+        )
+        if self.source_metadata.source_h5_path.resolve() != self.source_h5_path.resolve():
+            raise ValueError("planner source metadata belongs to a different HDF5")
         self._source = None
         self._sidecar = None
 
@@ -56,11 +70,27 @@ class PlannerLandscapeH5Dataset(Dataset):
                 protocol = protocol.decode("utf-8")
             if protocol != expected_protocol:
                 raise ValueError(f"sidecar protocol={protocol!r}, expected {expected_protocol!r}")
+            config_sha256 = sidecar.attrs.get("config_sha256", "")
+            if isinstance(config_sha256, bytes):
+                config_sha256 = config_sha256.decode("utf-8")
+            if (
+                expected_config_sha256 is not None
+                and config_sha256 != expected_config_sha256
+            ):
+                raise ValueError("planner sidecar config SHA-256 does not match training config")
             if not bool(sidecar.attrs.get("complete", False)):
                 raise ValueError(f"incomplete planner sidecar: {self.sidecar_h5_path}")
             self.branches_per_group = int(sidecar.attrs["branches_per_state"])
             if self.branches_per_group < 2:
                 raise ValueError("planner landscape requires at least two branches per group")
+            if (
+                expected_branches_per_group is not None
+                and self.branches_per_group != int(expected_branches_per_group)
+            ):
+                raise ValueError(
+                    f"planner branches/group={self.branches_per_group}, "
+                    f"expected {expected_branches_per_group}"
+                )
             if int(sidecar.attrs["frameskip"]) != self.frameskip:
                 raise ValueError("planner sidecar frameskip does not match training config")
             for key in (
@@ -82,6 +112,11 @@ class PlannerLandscapeH5Dataset(Dataset):
             group_ids = np.asarray(sidecar["group_id"][:], dtype=np.int64)
             slots = np.asarray(sidecar["branch_slot"][:], dtype=np.int64)
             groups = len(self.context_rows)
+            if expected_groups is not None and groups != int(expected_groups):
+                raise ValueError(f"planner groups={groups}, expected {expected_groups}")
+            branch_count = groups * self.branches_per_group
+            if len(self.episode_ids) != groups:
+                raise ValueError("planner sidecar episode IDs do not match selected groups")
             if not np.array_equal(
                 group_ids,
                 np.repeat(np.arange(groups, dtype=np.int64), self.branches_per_group),
@@ -92,31 +127,38 @@ class PlannerLandscapeH5Dataset(Dataset):
                 np.tile(np.arange(self.branches_per_group), groups),
             ):
                 raise ValueError("planner branch slots are not canonical")
+            if sidecar["raw_action"].shape != (
+                branch_count,
+                self.frameskip,
+                self.source_metadata.action_dim,
+            ):
+                raise ValueError(
+                    "planner raw_action shape does not match branches/frameskip/action_dim"
+                )
+            if sidecar["next_pixels"].shape[0] != branch_count:
+                raise ValueError("planner next_pixels does not match branch count")
+            sidecar_pixel_shape = tuple(sidecar["next_pixels"].shape[1:])
 
         with h5py.File(self.source_h5_path, "r", swmr=True) as source:
-            for key in (
-                "pixels",
-                "action",
-                "observation",
-                "ep_idx",
-                "ep_len",
-                "ep_offset",
-            ):
+            for key in ("pixels", "action", *self.source_metadata.proprio_keys):
                 if key not in source:
                     raise KeyError(f"source HDF5 lacks {key!r}")
             row_count = int(source["pixels"].shape[0])
+            if sidecar_pixel_shape != tuple(source["pixels"].shape[1:]):
+                raise ValueError("planner next_pixels shape does not match source pixels")
             if np.any(self.context_rows < 0) or np.any(self.context_rows >= row_count):
                 raise ValueError("planner sidecar context row is outside source HDF5")
-            row_offsets = np.asarray(source["ep_offset"][:], dtype=np.int64)
-            row_lengths = np.asarray(source["ep_len"][:], dtype=np.int64)
-            row_episode_ids = np.asarray(source["ep_idx"][:], dtype=np.int64)
-            source_physical_ids = row_episode_ids[self.context_rows]
+            source_physical_ids = self.source_metadata.physical_episode_ids_for_rows(
+                self.context_rows
+            )
             if not np.array_equal(source_physical_ids, self.physical_episode_ids):
                 raise ValueError("planner sidecar physical episode IDs do not match source rows")
-            source_metadata_ids = row_offsets[self.context_rows]
+            source_metadata_ids = self.source_metadata.metadata_episode_ids_for_rows(
+                self.context_rows
+            )
             if not np.array_equal(source_metadata_ids, self.episode_ids):
-                raise ValueError("planner sidecar metadata episode IDs do not match source offsets")
-            episode_end = row_offsets[self.context_rows] + row_lengths[self.context_rows]
+                raise ValueError("planner sidecar metadata episode IDs do not match source rows")
+            episode_end = self.source_metadata.episode_ends_for_rows(self.context_rows)
             goal_rows = self.context_rows + self.goal_offset_steps
             valid = goal_rows < episode_end
             self.group_indices = np.flatnonzero(valid).astype(np.int64)
@@ -124,7 +166,7 @@ class PlannerLandscapeH5Dataset(Dataset):
             self.episode_ids = self.episode_ids[valid]
             self.physical_episode_ids = self.physical_episode_ids[valid]
             self.goal_rows = goal_rows[valid]
-            self.raw_action_dim = int(source["action"].shape[-1])
+            self.raw_action_dim = self.source_metadata.action_dim
 
     def __len__(self):
         return len(self.group_indices)
@@ -177,7 +219,12 @@ class PlannerLandscapeH5Dataset(Dataset):
         action = torch.from_numpy(np.asarray(sidecar["raw_action"][start:stop], dtype=np.float32))
         action = (action - self.action_mean) / self.action_std
         action = action.reshape(self.branches_per_group, 1, -1)
-        proprio = torch.from_numpy(np.asarray(source["observation"][context_row], dtype=np.float32))
+        proprio = torch.from_numpy(
+            self.source_metadata.load_proprio(
+                source,
+                np.asarray([context_row], dtype=np.int64),
+            )[0]
+        )
         proprio = (proprio - self.proprio_mean) / self.proprio_std
         return {
             "context_visual": pixels[0:1],

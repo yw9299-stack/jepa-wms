@@ -365,6 +365,7 @@ def load_checkpoint_state_dict(
     load_act_enc=True,
     load_prop_enc=True,
     load_opt_scale_epoch=True,
+    strict_resume=False,
 ):
     """Load state dicts from checkpoint data onto model modules.
 
@@ -397,7 +398,7 @@ def load_checkpoint_state_dict(
             "state_encoder.bias": "proprio_encoder.bias",
         }
         pretrained_dict = {key_mapping.get(k, k): v for k, v in pretrained_dict.items()}
-        msg = predictor.load_state_dict(pretrained_dict, strict=False)
+        msg = predictor.load_state_dict(pretrained_dict, strict=strict_resume)
         logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
         # Check for expected missing keys (attention mask buffers) and inform user
@@ -409,16 +410,24 @@ def load_checkpoint_state_dict(
                 )
 
     # -- loading action encoder
-    if load_act_enc and action_encoder and checkpoint.get("action_encoder") is not None:
-        pretrained_dict = clean_state_dict(checkpoint["action_encoder"])
-        msg = action_encoder.load_state_dict(pretrained_dict, strict=False)
-        logger.info(f"loaded pretrained action encoder from epoch {epoch} with msg: {msg}")
+    if load_act_enc and action_encoder:
+        if checkpoint.get("action_encoder") is None:
+            if strict_resume:
+                raise RuntimeError("strict resume checkpoint has no action encoder state")
+        else:
+            pretrained_dict = clean_state_dict(checkpoint["action_encoder"])
+            msg = action_encoder.load_state_dict(pretrained_dict, strict=strict_resume)
+            logger.info(f"loaded pretrained action encoder from epoch {epoch} with msg: {msg}")
 
     # -- loading proprio encoder
-    if load_prop_enc and proprio_encoder and checkpoint.get("proprio_encoder") is not None:
-        pretrained_dict = clean_state_dict(checkpoint["proprio_encoder"])
-        msg = proprio_encoder.load_state_dict(pretrained_dict, strict=False)
-        logger.info(f"loaded pretrained proprio encoder from epoch {epoch} with msg: {msg}")
+    if load_prop_enc and proprio_encoder:
+        if checkpoint.get("proprio_encoder") is None:
+            if strict_resume:
+                raise RuntimeError("strict resume checkpoint has no proprio encoder state")
+        else:
+            pretrained_dict = clean_state_dict(checkpoint["proprio_encoder"])
+            msg = proprio_encoder.load_state_dict(pretrained_dict, strict=strict_resume)
+            logger.info(f"loaded pretrained proprio encoder from epoch {epoch} with msg: {msg}")
 
     # -- loading optimizer
     if load_opt_scale_epoch and opt is not None:
@@ -426,8 +435,12 @@ def load_checkpoint_state_dict(
             opt.load_state_dict(checkpoint["opt"])
             logger.info(f"loaded optimizers from epoch {epoch}")
         except KeyError:
+            if strict_resume:
+                raise RuntimeError("strict resume checkpoint has no optimizer state")
             logger.warning("Optimizer state not found in checkpoint, skipping optimizer load.")
         except ValueError as e:
+            if strict_resume:
+                raise RuntimeError("strict resume optimizer state is incompatible") from e
             logger.warning(
                 f"Failed to load optimizer state due to parameter group mismatch: {e}\n"
                 f"This is likely due to model architecture changes (e.g., removed extrinsics_encoder). "
@@ -438,6 +451,8 @@ def load_checkpoint_state_dict(
                 scaler.load_state_dict(checkpoint["scaler"])
                 logger.info(f"loaded scaler from epoch {epoch}")
             except KeyError:
+                if strict_resume:
+                    raise RuntimeError("strict resume checkpoint has no scaler state")
                 logger.warning("Scaler state not found in checkpoint, skipping scaler load.")
 
     return (
@@ -492,6 +507,11 @@ def load_checkpoint(
     load_stats=True,
     train_predictor=True,
     train_heads=False,
+    strict_resume=False,
+    expected_optimizer_steps_per_epoch=None,
+    expected_gradient_accumulation_steps=None,
+    expected_training_provenance=None,
+    expected_common_trainable_initialization_sha256=None,
 ):
     """Load checkpoint from local file path and apply to model modules.
 
@@ -518,6 +538,33 @@ def load_checkpoint(
         tuple: (predictor, action_encoder, proprio_encoder, heads, opt, scaler, epoch)
     """
     checkpoint = fetch_checkpoint(r_path, device="cpu")
+    if strict_resume:
+        for key, expected in (
+            ("optimizer_steps_per_epoch", expected_optimizer_steps_per_epoch),
+            ("gradient_accumulation_steps", expected_gradient_accumulation_steps),
+        ):
+            if expected is not None and checkpoint.get(key) != expected:
+                raise RuntimeError(
+                    f"strict resume {key}={checkpoint.get(key)!r}, expected {expected!r}"
+                )
+        if (
+            expected_training_provenance is not None
+            and checkpoint.get("training_provenance") != expected_training_provenance
+        ):
+            raise RuntimeError("strict resume training provenance differs from the checkpoint")
+        if (
+            expected_common_trainable_initialization_sha256 is not None
+            and checkpoint.get("common_trainable_initialization_sha256")
+            != expected_common_trainable_initialization_sha256
+        ):
+            raise RuntimeError("strict resume common initialization fingerprint differs")
+        epoch = int(checkpoint.get("epoch", -1))
+        if (
+            expected_optimizer_steps_per_epoch is not None
+            and checkpoint.get("total_optimizer_steps")
+            != epoch * int(expected_optimizer_steps_per_epoch)
+        ):
+            raise RuntimeError("strict resume total optimizer-step count differs")
 
     (
         predictor,
@@ -536,6 +583,7 @@ def load_checkpoint(
         load_act_enc=load_act_enc,
         load_prop_enc=load_prop_enc,
         load_opt_scale_epoch=load_opt_scale_epoch,
+        strict_resume=strict_resume,
     )
 
     # Load heads from separate files if requested

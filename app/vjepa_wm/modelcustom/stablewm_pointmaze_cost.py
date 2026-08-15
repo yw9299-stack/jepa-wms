@@ -120,7 +120,9 @@ class StableWMPointMazeCost(torch.nn.Module):
         }
 
     @staticmethod
-    def _tensor_identity(value: torch.Tensor) -> tuple:
+    def _tensor_identity(value) -> tuple:
+        if isinstance(value, tuple):
+            return tuple(StableWMPointMazeCost._tensor_identity(item) for item in value)
         return (
             value.data_ptr(),
             value.storage_offset(),
@@ -133,7 +135,7 @@ class StableWMPointMazeCost(torch.nn.Module):
     @torch.inference_mode()
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:
         if "pixels" not in info_dict or "goal" not in info_dict:
-            raise KeyError("PointMaze planning requires both pixels and goal")
+            raise KeyError("StableWM planning requires both pixels and goal")
         if action_candidates.ndim != 4:
             raise ValueError(
                 "action candidates must have shape [batch, samples, horizon, action_block_dim]; "
@@ -148,11 +150,7 @@ class StableWMPointMazeCost(torch.nn.Module):
         goal_expanded = info_dict["goal"]
         pixels = _single_candidate_copy(pixels_expanded, "pixels")
         goal_pixels = _single_candidate_copy(goal_expanded, "goal")
-        proprio_key = "proprio" if "proprio" in info_dict else "state"
-        if proprio_key not in info_dict:
-            raise KeyError("PointMaze JEPA-WM requires proprio or state in evaluator info")
-        proprio_expanded = info_dict[proprio_key]
-        proprio = _single_candidate_copy(proprio_expanded, proprio_key)
+        proprio_expanded, proprio = self._proprio_from_info(info_dict)
 
         if pixels.ndim != 5 or goal_pixels.ndim != 5 or proprio.ndim != 3:
             raise ValueError(
@@ -242,6 +240,52 @@ class StableWMPointMazeCost(torch.nn.Module):
             raise FloatingPointError("JEPA-WM planner produced non-finite candidate costs")
         return costs
 
+    def _proprio_from_info(self, info_dict):
+        values = []
+        expanded_values = []
+        for source_key in self.source_metadata.proprio_keys:
+            runtime_key = source_key
+            if runtime_key not in info_dict and runtime_key.startswith("proprio_"):
+                runtime_key = runtime_key.replace("proprio_", "proprio/", 1)
+            if runtime_key not in info_dict:
+                values = []
+                expanded_values = []
+                break
+            expanded = info_dict[runtime_key]
+            value = _single_candidate_copy(expanded, runtime_key)
+            if value.ndim == 2:
+                value = value.unsqueeze(-1)
+            if value.ndim != 3:
+                raise ValueError(f"unexpected proprio component {runtime_key}: {value.shape}")
+            expanded_values.append(expanded)
+            values.append(value.flatten(start_dim=2))
+
+        if values:
+            proprio = torch.cat(values, dim=-1)
+            if proprio.shape[-1] != self.source_metadata.proprio_dim:
+                raise ValueError(
+                    f"assembled proprio dim={proprio.shape[-1]}, "
+                    f"expected {self.source_metadata.proprio_dim}"
+                )
+            # Cache identity needs one stable object. Tuple identity covers all
+            # task-specific runtime components without copying their payload.
+            identity = tuple(expanded_values)
+            return identity, proprio
+
+        for fallback in ("proprio", "state"):
+            if fallback not in info_dict:
+                continue
+            expanded = info_dict[fallback]
+            proprio = _single_candidate_copy(expanded, fallback)
+            if proprio.ndim == 2:
+                proprio = proprio.unsqueeze(-1)
+            if proprio.ndim == 3 and proprio.shape[-1] == self.source_metadata.proprio_dim:
+                return expanded, proprio
+        raise KeyError(
+            "evaluator info cannot provide the configured StableWM proprio columns: "
+            f"{self.source_metadata.proprio_keys}"
+        )
+
 
 def build_stablewm_pointmaze_cost(
     *,
@@ -253,6 +297,7 @@ def build_stablewm_pointmaze_cost(
     owner: str,
     candidate_chunk_size: int = 32,
     device: str | torch.device = "cuda",
+    strict_checkpoint: bool = True,
 ) -> StableWMPointMazeCost:
     """Load either the PI or matched-vanilla checkpoint for Medium planning."""
 
@@ -274,6 +319,11 @@ def build_stablewm_pointmaze_cost(
     metadata = StableWMH5Metadata(
         source_h5,
         normalize_action=bool(cfg_data["custom"].get("normalize_action", True)),
+        proprio_keys=cfg_data["custom"].get("proprio_keys"),
+        expected_action_dim=cfg_data["custom"].get("expected_action_dim"),
+        expected_proprio_dim=cfg_data["custom"].get("expected_proprio_dim"),
+        expected_row_count=cfg_data["custom"].get("expected_row_count"),
+        expected_episode_count=cfg_data["custom"].get("expected_episode_count"),
     )
     transform = make_transforms(img_size=int(cfg_data["img_size"]), **cfg_data_aug)
     inverse_transform = make_inverse_transforms(img_size=int(cfg_data["img_size"]), **cfg_data_aug)
@@ -288,7 +338,11 @@ def build_stablewm_pointmaze_cost(
         inverse_transform=inverse_transform,
     )
 
-    wrapper_kwargs = {"ctxt_window": 3, "proprio_mode": "predict_proprio"}
+    wrapper_kwargs = {
+        "ctxt_window": 3,
+        "proprio_mode": "predict_proprio",
+        "strict_checkpoint": bool(strict_checkpoint),
+    }
     if owner == "pi":
         mode, value = PI_SCALE_ARMS[arm]
         wrapper_kwargs.update(

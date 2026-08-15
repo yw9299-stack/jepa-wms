@@ -63,6 +63,7 @@ def init_module(
     wrapper_kwargs = dict(wrapper_kwargs or {})
     scale_intervention_mode = wrapper_kwargs.pop("planner_identified_scale_intervention_mode", None)
     scale_intervention_value = wrapper_kwargs.pop("planner_identified_scale_intervention_value", None)
+    strict_checkpoint = bool(wrapper_kwargs.pop("strict_checkpoint", False))
 
     img_size = cfgs_data.get("img_size", 256)
     frameskip = cfgs_data.get("custom").get("frameskip", 1)
@@ -182,6 +183,7 @@ def init_module(
         predictor=predictor,
         action_encoder=action_encoder,
         proprio_encoder=proprio_encoder,
+        strict_resume=strict_checkpoint,
     )
     del checkpoint_data
 
