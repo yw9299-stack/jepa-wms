@@ -51,8 +51,8 @@ if [ "$TASK" = pusht ]; then
   SIDECAR="$PI_LTC_PUSHT_SIDECAR"
   EXPECTED_SOURCE_BYTES=46300921856
   EXPECTED_SIDECAR_BYTES=192116437
-  PI_RUN="pusht_jepa_wm_pi_ltc_5pass_v2_seed3072"
-  VANILLA_RUN="pusht_jepa_wm_vanilla_5pass_v2_seed3072"
+  PI_RUN="pusht_jepa_wm_pi_ltc_5pass_v3_seed3072"
+  VANILLA_RUN="pusht_jepa_wm_vanilla_5pass_v3_seed3072"
 else
   export PI_LTC_CUBE_SOURCE="${PI_LTC_CUBE_SOURCE:-/root/autodl-tmp/lewm_data/ogbench/cube_single_expert.h5}"
   export PI_LTC_CUBE_SIDECAR="${PI_LTC_CUBE_SIDECAR:-/root/autodl-tmp/lewm_data/ogbench/cube_counterfactual_cem0_seed3072.h5}"
@@ -60,8 +60,8 @@ else
   SIDECAR="$PI_LTC_CUBE_SIDECAR"
   EXPECTED_SOURCE_BYTES=101942558720
   EXPECTED_SIDECAR_BYTES=1282198884
-  PI_RUN="cube_jepa_wm_pi_ltc_5pass_v2_seed3072"
-  VANILLA_RUN="cube_jepa_wm_vanilla_5pass_v2_seed3072"
+  PI_RUN="cube_jepa_wm_pi_ltc_5pass_v3_seed3072"
+  VANILLA_RUN="cube_jepa_wm_vanilla_5pass_v3_seed3072"
 fi
 
 if [ "$NO_FILE_SCAN" = 1 ]; then

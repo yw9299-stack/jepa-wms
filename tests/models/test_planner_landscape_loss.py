@@ -88,6 +88,54 @@ class TestPlannerLandscapeLoss(unittest.TestCase):
         self.assertEqual(diagnostics["valid_group_count"].item(), 1)
         self.assertEqual(diagnostics["valid_group_fraction"].item(), 0.5)
 
+    def test_relative_floor_rejects_group_far_below_batch_median_energy(self):
+        real = torch.tensor(
+            [
+                [0.0, 1.0e-4, 2.0e-4],
+                [0.0, 1.0, 2.0],
+                [0.0, 2.0, 4.0],
+            ]
+        )
+        predicted = torch.tensor(
+            [
+                [-100.0, 0.0, 100.0],
+                [0.0, 1.5, 2.5],
+                [0.0, 2.5, 3.5],
+            ],
+            requires_grad=True,
+        )
+        loss, diagnostics = normalized_pairwise_landscape_error(
+            predicted,
+            real,
+            relative_energy_floor=1.0e-4,
+            return_diagnostics=True,
+        )
+        expected = normalized_pairwise_landscape_error(
+            predicted[1:],
+            real[1:],
+        )
+
+        torch.testing.assert_close(loss, expected, rtol=0.0, atol=0.0)
+        loss.backward()
+        torch.testing.assert_close(predicted.grad[0], torch.zeros(3))
+        self.assertEqual(diagnostics["valid_group_count"].item(), 2)
+        self.assertAlmostEqual(
+            diagnostics["target_energy_effective_floor"].item(),
+            diagnostics["target_energy_median"].item() * 1.0e-4,
+        )
+
+    def test_relative_floor_must_be_finite_and_non_negative(self):
+        predicted = torch.zeros(1, 2)
+        real = torch.ones(1, 2)
+        for invalid in (-1.0, float("inf"), float("nan")):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    normalized_pairwise_landscape_error(
+                        predicted,
+                        real,
+                        relative_energy_floor=invalid,
+                    )
+
     def test_all_unidentifiable_groups_produce_safe_zero_gradient(self):
         real = torch.ones(2, 4)
         predicted = torch.randn(2, 4, requires_grad=True)

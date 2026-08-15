@@ -32,8 +32,12 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
                     1.0e-8,
                 )
                 self.assertEqual(
+                    pi["planner_identified"]["target_energy_relative_floor"],
+                    1.0e-4,
+                )
+                self.assertEqual(
                     pi["planner_identified"]["target_energy_eligibility"],
-                    "strictly_greater_than_eps",
+                    "strictly_greater_than_max_eps_or_1e-4_batch_median",
                 )
                 self.assertEqual(
                     pi["planner_identified"]["gradient_clip_ownership"],

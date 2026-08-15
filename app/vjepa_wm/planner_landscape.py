@@ -28,6 +28,7 @@ def normalized_pairwise_landscape_error(
     real_cost,
     eps=1.0e-8,
     *,
+    relative_energy_floor=0.0,
     return_diagnostics=False,
 ):
     """Return the normalized landscape error over numerically identifiable groups.
@@ -37,18 +38,30 @@ def normalized_pairwise_landscape_error(
     guard, the realized candidate order is not numerically identifiable.  Such
     groups must not own a scale gradient: replacing their denominator by
     ``eps`` would turn representation noise into an arbitrarily large relative
-    error.  Every identifiable group retains the exact previous objective.
+    error.  A batch-relative floor also rejects groups whose RMS candidate
+    separation is negligible beside a typical group in the same planner
+    batch.  Every identifiable group retains the exact previous objective.
     """
 
     if predicted_cost.shape != real_cost.shape:
         raise ValueError("predicted and real planner costs must have identical shapes")
     if not torch.isfinite(torch.tensor(float(eps))) or float(eps) <= 0.0:
         raise ValueError("eps must be finite and positive")
+    if (
+        not torch.isfinite(torch.tensor(float(relative_energy_floor)))
+        or float(relative_energy_floor) < 0.0
+    ):
+        raise ValueError("relative_energy_floor must be finite and non-negative")
     predicted_difference = pairwise_cost_differences(predicted_cost)
     real_difference = pairwise_cost_differences(real_cost.detach())
     numerator = (predicted_difference - real_difference).square().mean(dim=1)
     target_energy = real_difference.square().mean(dim=1)
-    valid_group = target_energy > float(eps)
+    target_energy_median = target_energy.median()
+    effective_energy_floor = torch.maximum(
+        target_energy.new_tensor(float(eps)),
+        target_energy_median * float(relative_energy_floor),
+    )
+    valid_group = target_energy > effective_energy_floor
     valid_group_count = valid_group.sum()
     if bool(valid_group.any()):
         loss = (numerator[valid_group] / target_energy[valid_group]).mean()
@@ -65,8 +78,14 @@ def normalized_pairwise_landscape_error(
         "valid_group_fraction": valid_group.float().mean(),
         "target_energy": target_energy,
         "target_energy_min": target_energy.min(),
-        "target_energy_median": target_energy.median(),
+        "target_energy_median": target_energy_median,
         "target_energy_max": target_energy.max(),
+        "target_energy_effective_floor": effective_energy_floor,
+        "target_energy_relative_floor": target_energy.new_tensor(
+            float(relative_energy_floor)
+        ),
+        "target_energy_min_to_median_ratio": target_energy.min()
+        / target_energy_median.clamp_min(float(eps)),
     }
     return loss, diagnostics
 
@@ -206,6 +225,7 @@ def planner_landscape_result(
     dtype,
     mixed_precision,
     target_energy_eps=1.0e-8,
+    target_energy_relative_floor=0.0,
 ):
     """Compute the landscape objective and its gradient only for log(scale).
 
@@ -253,6 +273,7 @@ def planner_landscape_result(
                 predicted_cost,
                 real_cost,
                 eps=target_energy_eps,
+                relative_energy_floor=target_energy_relative_floor,
                 return_diagnostics=True,
             )
 
@@ -288,6 +309,15 @@ def planner_landscape_result(
         "planner_target_energy_min": landscape_diagnostics["target_energy_min"],
         "planner_target_energy_median": landscape_diagnostics["target_energy_median"],
         "planner_target_energy_max": landscape_diagnostics["target_energy_max"],
+        "planner_target_energy_effective_floor": landscape_diagnostics[
+            "target_energy_effective_floor"
+        ],
+        "planner_target_energy_relative_floor": landscape_diagnostics[
+            "target_energy_relative_floor"
+        ],
+        "planner_target_energy_min_to_median_ratio": landscape_diagnostics[
+            "target_energy_min_to_median_ratio"
+        ],
         "planner_target_energy_eps": predicted_cost.new_tensor(
             float(target_energy_eps)
         ),

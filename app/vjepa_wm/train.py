@@ -625,6 +625,17 @@ def main(args, resume_preempt=False):
 
     # Logger
     class Trainer:
+        _visible_wandb_metrics = (
+            "epoch",
+            "loss",
+            "planner_landscape_loss",
+            "planner_log_scale",
+            "planner_scale",
+            "planner_valid_group_fraction",
+            "planner_valid_pairwise_sign_accuracy",
+            "optim/planner_scale/grad_norm_before_clip",
+        )
+
         def __init__(self, config):
             if quick_debug:
                 config["debug"] = quick_debug
@@ -650,6 +661,11 @@ def main(args, resume_preempt=False):
                     with open(wandb_run_id_file, "w") as f:
                         f.write(wandb.run.id)
                 wandb.run.name = os.path.basename(folder)
+                # Retain every scalar for audit/export while preventing W&B's
+                # automatic workspace from creating dozens of low-value panels.
+                wandb.define_metric("*", hidden=True)
+                for metric_name in self._visible_wandb_metrics:
+                    wandb.define_metric(metric_name, hidden=False)
                 self.job_set = set()
 
         def log(self, epoch, itr, losses, total_stats, eval_losses=None, eval_total_stats=None, image_stats=None):
@@ -984,6 +1000,9 @@ def main(args, resume_preempt=False):
             "planner_target_energy_median": zero,
             "planner_target_energy_max": zero,
             "planner_target_energy_eps": zero,
+            "planner_target_energy_effective_floor": zero,
+            "planner_target_energy_relative_floor": zero,
+            "planner_target_energy_min_to_median_ratio": zero,
             "planner_scale": scale_module.input_scale.detach(),
             "planner_log_scale": scale_module.log_scale.detach(),
             "planner_scale_gradient": zero,
@@ -1139,6 +1158,8 @@ def main(args, resume_preempt=False):
         canary_landscape_loss_meter = AverageMeter()
         canary_sign_accuracy_meter = AverageMeter()
         canary_scale_gradient_abs_meter = AverageMeter()
+        canary_effective_energy_floor_meter = AverageMeter()
+        canary_min_to_median_energy_ratio_meter = AverageMeter()
         for epoch in range(start_epoch, num_epochs):
             logger.info("\n" + "─" * 50)
             logger.info(f"📈 Epoch {epoch + 1}/{num_epochs}")
@@ -1442,6 +1463,12 @@ def main(args, resume_preempt=False):
                                                 1.0e-8,
                                             )
                                         ),
+                                        target_energy_relative_floor=float(
+                                            cfgs_planner_identified.get(
+                                                "target_energy_relative_floor",
+                                                0.0,
+                                            )
+                                        ),
                                     )
                                     planner_last_stats.update(planner_result.stats)
                                     total_stats.update(planner_last_stats)
@@ -1726,6 +1753,20 @@ def main(args, resume_preempt=False):
                         canary_scale_gradient_abs_meter.update(
                             abs(float(total_stats["planner_scale_gradient"]))
                         )
+                        canary_effective_energy_floor_meter.update(
+                            float(
+                                total_stats[
+                                    "planner_target_energy_effective_floor"
+                                ]
+                            )
+                        )
+                        canary_min_to_median_energy_ratio_meter.update(
+                            float(
+                                total_stats[
+                                    "planner_target_energy_min_to_median_ratio"
+                                ]
+                            )
+                        )
                     if train_csv_logger is None:  # Initialize the logger once
                         train_csv_logger = create_csv_logger(losses, total_stats, train=True)
                 else:
@@ -1853,6 +1894,12 @@ def main(args, resume_preempt=False):
                                 1.0e-8,
                             )
                         ),
+                        "target_energy_relative_floor": float(
+                            cfgs_planner_identified.get(
+                                "target_energy_relative_floor",
+                                0.0,
+                            )
+                        ),
                         "final_log_scale": float(scale.log_scale.detach().cpu()),
                         "final_scale": float(scale.input_scale.detach().cpu()),
                         "valid_group_fraction": {
@@ -1871,6 +1918,16 @@ def main(args, resume_preempt=False):
                         "planner_scale_gradient_abs": {
                             "mean": canary_scale_gradient_abs_meter.avg,
                             "max": canary_scale_gradient_abs_meter.max,
+                        },
+                        "target_energy_effective_floor": {
+                            "mean": canary_effective_energy_floor_meter.avg,
+                            "min": canary_effective_energy_floor_meter.min,
+                            "max": canary_effective_energy_floor_meter.max,
+                        },
+                        "target_energy_min_to_median_ratio": {
+                            "mean": canary_min_to_median_energy_ratio_meter.avg,
+                            "min": canary_min_to_median_energy_ratio_meter.min,
+                            "max": canary_min_to_median_energy_ratio_meter.max,
                         },
                         "repository_commit": (
                             training_provenance.get("repository_commit")
