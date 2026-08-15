@@ -23,24 +23,28 @@ EXPECTED_COMMIT="${PI_LTC_EXPECTED_COMMIT:?set PI_LTC_EXPECTED_COMMIT to the det
 LEWM_REPO="${LEWM_REPO:-/root/autodl-tmp/lewm_figure6_crossmodel_clean}"
 EXPECTED_LEWM_COMMIT="${PI_LTC_EXPECTED_LEWM_COMMIT:-2f4b66934b844a2cacc9454106b9ab163e20c4be}"
 export JEPAWM_LOGS="${JEPAWM_LOGS:-/root/autodl-tmp/lewm_data/jepa_wms}"
+NO_FILE_SCAN="${NO_FILE_SCAN:-0}"
+test "$NO_FILE_SCAN" = 0 -o "$NO_FILE_SCAN" = 1 || { echo "[STOP] NO_FILE_SCAN must be 0 or 1"; exit 1; }
 
 fail() { echo "[STOP] $*"; exit 1; }
 
 test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT" || fail "JEPA HEAD is not $EXPECTED_COMMIT"
 git diff --quiet || fail "JEPA tracked worktree is dirty"
 git diff --cached --quiet || fail "JEPA index is dirty"
-test -d "$LEWM_REPO/.git" -o -f "$LEWM_REPO/.git" || fail "missing clean LEWM worktree: $LEWM_REPO"
-test "$(git -C "$LEWM_REPO" rev-parse HEAD)" = "$EXPECTED_LEWM_COMMIT" || fail "LEWM commit mismatch"
-git -C "$LEWM_REPO" diff --quiet || fail "LEWM tracked worktree is dirty"
-git -C "$LEWM_REPO" diff --cached --quiet || fail "LEWM index is dirty"
+if [ "$NO_FILE_SCAN" = 0 ]; then
+  test -d "$LEWM_REPO/.git" -o -f "$LEWM_REPO/.git" || fail "missing clean LEWM worktree: $LEWM_REPO"
+  test "$(git -C "$LEWM_REPO" rev-parse HEAD)" = "$EXPECTED_LEWM_COMMIT" || fail "LEWM commit mismatch"
+  git -C "$LEWM_REPO" diff --quiet || fail "LEWM tracked worktree is dirty"
+  git -C "$LEWM_REPO" diff --cached --quiet || fail "LEWM index is dirty"
+fi
 
 if [ "$TASK" = pusht ]; then
   export PI_LTC_PUSHT_SOURCE="${PI_LTC_PUSHT_SOURCE:-/root/autodl-tmp/lewm_data/pusht_expert_train.h5}"
   export PI_LTC_PUSHT_SIDECAR="${PI_LTC_PUSHT_SIDECAR:-/root/autodl-tmp/lewm_data/pusht_planner_counterfactual_cem0_seed3072.h5}"
   SOURCE="$PI_LTC_PUSHT_SOURCE"
   SIDECAR="$PI_LTC_PUSHT_SIDECAR"
-  SOURCE_SHA="${PI_LTC_PUSHT_SOURCE_SHA256:?set PI_LTC_PUSHT_SOURCE_SHA256}"
-  SIDECAR_SHA="${PI_LTC_PUSHT_SIDECAR_SHA256:?set PI_LTC_PUSHT_SIDECAR_SHA256}"
+  EXPECTED_SOURCE_BYTES=46300921856
+  EXPECTED_SIDECAR_BYTES=192116437
   PI_RUN="pusht_jepa_wm_pi_ltc_5pass_seed3072"
   VANILLA_RUN="pusht_jepa_wm_vanilla_5pass_seed3072"
 else
@@ -48,10 +52,27 @@ else
   export PI_LTC_CUBE_SIDECAR="${PI_LTC_CUBE_SIDECAR:-/root/autodl-tmp/lewm_data/ogbench/cube_counterfactual_cem0_seed3072.h5}"
   SOURCE="$PI_LTC_CUBE_SOURCE"
   SIDECAR="$PI_LTC_CUBE_SIDECAR"
-  SOURCE_SHA="${PI_LTC_CUBE_SOURCE_SHA256:?set PI_LTC_CUBE_SOURCE_SHA256}"
-  SIDECAR_SHA="${PI_LTC_CUBE_SIDECAR_SHA256:?set PI_LTC_CUBE_SIDECAR_SHA256}"
+  EXPECTED_SOURCE_BYTES=101942558720
+  EXPECTED_SIDECAR_BYTES=1282198884
   PI_RUN="cube_jepa_wm_pi_ltc_5pass_seed3072"
   VANILLA_RUN="cube_jepa_wm_vanilla_5pass_seed3072"
+fi
+
+if [ "$NO_FILE_SCAN" = 1 ]; then
+  # SHA-256 of the literal marker, not of either data file.  Provenance records
+  # the mode explicitly so this cannot be mistaken for content verification.
+  SOURCE_SHA=f259ec4020fbbe9ab7765c4ca9dc2d67c6c21b7c5b11b8b6bab564fb77c5a5ba
+  SIDECAR_SHA="$SOURCE_SHA"
+  export PI_LTC_CONTENT_HASH_MODE=not_scanned_user_confirmed
+else
+  if [ "$TASK" = pusht ]; then
+    SOURCE_SHA="${PI_LTC_PUSHT_SOURCE_SHA256:?set PI_LTC_PUSHT_SOURCE_SHA256}"
+    SIDECAR_SHA="${PI_LTC_PUSHT_SIDECAR_SHA256:?set PI_LTC_PUSHT_SIDECAR_SHA256}"
+  else
+    SOURCE_SHA="${PI_LTC_CUBE_SOURCE_SHA256:?set PI_LTC_CUBE_SOURCE_SHA256}"
+    SIDECAR_SHA="${PI_LTC_CUBE_SIDECAR_SHA256:?set PI_LTC_CUBE_SIDECAR_SHA256}"
+  fi
+  export PI_LTC_CONTENT_HASH_MODE=sha256
 fi
 
 export PI_LTC_REPOSITORY_COMMIT="$EXPECTED_COMMIT"
@@ -60,6 +81,8 @@ export PI_LTC_SIDECAR_SHA256="$SIDECAR_SHA"
 
 test -f "$SOURCE" || fail "missing source: $SOURCE"
 test -f "$SIDECAR" || fail "missing sidecar: $SIDECAR"
+test "$(stat -c %s "$SOURCE")" = "$EXPECTED_SOURCE_BYTES" || fail "source byte size differs"
+test "$(stat -c %s "$SIDECAR")" = "$EXPECTED_SIDECAR_BYTES" || fail "sidecar byte size differs"
 test "${#SOURCE_SHA}" -eq 64 || fail "source SHA-256 must have 64 characters"
 test "${#SIDECAR_SHA}" -eq 64 || fail "sidecar SHA-256 must have 64 characters"
 
@@ -79,6 +102,12 @@ MODEL_AUDIT="$PREFLIGHT_DIR/model_preflight.json"
 PI_SMOKE_CKPT="$PREFLIGHT_DIR/pi_preflight.pth.tar"
 VANILLA_SMOKE_CKPT="$PREFLIGHT_DIR/vanilla_preflight.pth.tar"
 
+if [ "$NO_FILE_SCAN" = 1 ]; then
+  echo "[located only; no content scan] task=$TASK"
+  echo "[source] path=$(realpath "$SOURCE") bytes=$(stat -c %s "$SOURCE")"
+  echo "[sidecar] path=$(realpath "$SIDECAR") bytes=$(stat -c %s "$SIDECAR")"
+  echo "[user override] skipping content hashes, standalone data preflight, unit/model preflight, and LEWM smoke"
+else
 reuse_data_preflight=0
 if [ -f "$DATA_AUDIT" ]; then
   if python - "$DATA_AUDIT" "$SOURCE" "$SIDECAR" "$SOURCE_SHA" "$SIDECAR_SHA" "$EXPECTED_COMMIT" "$PI_CONFIG" "$VANILLA_CONFIG" <<'PY'
@@ -182,6 +211,7 @@ for smoke_arm in learned vanilla_5pass; do
 done
 
 echo "[preflight PASS] task=$TASK data=$DATA_AUDIT model=$MODEL_AUDIT evaluator=$SMOKE_ROOT"
+fi
 if [ "${PREFLIGHT_ONLY:-1}" = 1 ]; then
   echo "[preflight only] Set PREFLIGHT_ONLY=0 only after reviewing all audits."
   exit 0
@@ -199,11 +229,11 @@ fi
 LATEST="$RUN_DIR/jepa-latest.pth.tar"
 
 checkpoint_status() {
-  python - "$LATEST" "$OWNER" "$EXPECTED_COMMIT" "$SOURCE_SHA" "$SIDECAR_SHA" "$DATA_AUDIT" <<'PY'
+  python - "$LATEST" "$OWNER" "$EXPECTED_COMMIT" "$SOURCE_SHA" "$SIDECAR_SHA" "$DATA_AUDIT" "$NO_FILE_SCAN" "$PI_LTC_CONTENT_HASH_MODE" <<'PY'
 import json, sys
 from pathlib import Path
 import torch
-path, owner, commit, source_sha, sidecar_sha, audit_path = sys.argv[1:]
+path, owner, commit, source_sha, sidecar_sha, audit_path, no_file_scan, hash_mode = sys.argv[1:]
 path = Path(path)
 if not path.is_file():
     raise SystemExit(1)
@@ -215,12 +245,16 @@ if (owner == "pi" and len(scale) != 1) or (owner == "vanilla" and scale):
 provenance = checkpoint.get("training_provenance") or {}
 if (
     provenance.get("repository_commit") != commit
+    or provenance.get("content_hash_mode") != hash_mode
     or provenance.get("source_h5", {}).get("sha256") != source_sha
     or provenance.get("sidecar_h5", {}).get("sha256") != sidecar_sha
 ):
     raise SystemExit(2)
-steps = json.load(open(audit_path))["split"]["optimizer_steps_per_pass"]
-if checkpoint.get("optimizer_steps_per_epoch") != steps:
+if no_file_scan == "1":
+    steps = int(checkpoint.get("optimizer_steps_per_epoch", 0))
+else:
+    steps = json.load(open(audit_path))["split"]["optimizer_steps_per_pass"]
+if steps < 1 or checkpoint.get("optimizer_steps_per_epoch") != steps:
     raise SystemExit(2)
 initialization = checkpoint.get("common_trainable_initialization_sha256")
 if (

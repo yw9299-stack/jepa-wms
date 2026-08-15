@@ -67,3 +67,12 @@ noise 0, and CEM 16/256/top-k 64.  The evaluator records start/state and CEM
 generator-state hashes before the summary script computes pooled and
 hierarchical bootstrap intervals and exact McNemar tests for the two separate
 estimands.
+
+When the data locations and byte sizes have already been externally confirmed,
+`NO_FILE_SCAN=1 PREFLIGHT_ONLY=0` provides an explicit user-directed fast-start
+mode. It performs only path and byte-size checks, records
+`content_hash_mode=not_scanned_user_confirmed`, skips standalone hashes/data
+preflight/model smoke/LEWM smoke, and starts the requested arm. Dataset schema,
+episode boundaries, dimensions, and clip counts are still checked naturally
+during training initialization; action/proprio statistics must still be read
+because they are required for normalization.

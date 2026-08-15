@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 from copy import deepcopy
 from pathlib import Path
@@ -175,6 +176,7 @@ def main() -> int:
         "protocol": f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_5pass_v1",
         "repository_commit": commit,
         "repository_tracked_dirty": dirty,
+        "content_hash_mode": os.environ.get("PI_LTC_CONTENT_HASH_MODE", "sha256"),
         "base_config": {"path": str(args.base_config), "sha256": sha256_file(base_path)},
         "source_sha256": args.source_sha256.lower(),
         "sidecar_sha256": args.sidecar_sha256.lower(),

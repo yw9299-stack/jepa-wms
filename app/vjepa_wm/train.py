@@ -269,6 +269,9 @@ def main(args, resume_preempt=False):
                 "strict provenance requires environment variables: "
                 + ", ".join(missing_environment)
             )
+        content_hash_mode = os.environ.get("PI_LTC_CONTENT_HASH_MODE", "sha256")
+        if content_hash_mode not in {"sha256", "not_scanned_user_confirmed"}:
+            raise ValueError(f"unsupported strict provenance content-hash mode: {content_hash_mode}")
         repository_commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip()
@@ -292,14 +295,19 @@ def main(args, resume_preempt=False):
         training_provenance = {
             "repository_commit": repository_commit,
             "repository_tracked_dirty": repository_dirty,
+            "content_hash_mode": content_hash_mode,
             "source_h5": {
                 "path": str(source_path),
                 "bytes": source_path.stat().st_size,
+                "mtime_ns": source_path.stat().st_mtime_ns,
                 "sha256": os.environ["PI_LTC_SOURCE_SHA256"],
             },
             "sidecar_h5": {
                 "path": str(sidecar_path) if sidecar_path is not None else None,
                 "bytes": sidecar_path.stat().st_size if sidecar_path is not None else None,
+                "mtime_ns": (
+                    sidecar_path.stat().st_mtime_ns if sidecar_path is not None else None
+                ),
                 "sha256": os.environ["PI_LTC_SIDECAR_SHA256"],
             },
             "resolved_config": convert_to_dict_recursive(args),
