@@ -24,7 +24,13 @@ LEWM_REPO="${LEWM_REPO:-/root/autodl-tmp/lewm_figure6_crossmodel_clean}"
 EXPECTED_LEWM_COMMIT="${PI_LTC_EXPECTED_LEWM_COMMIT:-2f4b66934b844a2cacc9454106b9ab163e20c4be}"
 export JEPAWM_LOGS="${JEPAWM_LOGS:-/root/autodl-tmp/lewm_data/jepa_wms}"
 NO_FILE_SCAN="${NO_FILE_SCAN:-0}"
+CANARY_OPTIMIZER_STEPS="${CANARY_OPTIMIZER_STEPS:-0}"
 test "$NO_FILE_SCAN" = 0 -o "$NO_FILE_SCAN" = 1 || { echo "[STOP] NO_FILE_SCAN must be 0 or 1"; exit 1; }
+[[ "$CANARY_OPTIMIZER_STEPS" =~ ^[0-9]+$ ]] || { echo "[STOP] CANARY_OPTIMIZER_STEPS must be a non-negative integer"; exit 1; }
+if [ "$CANARY_OPTIMIZER_STEPS" -gt 0 ] && [ "$ARM" != pi ]; then
+  echo "[STOP] canary mode is PI-only"
+  exit 1
+fi
 
 fail() { echo "[STOP] $*"; exit 1; }
 
@@ -45,8 +51,8 @@ if [ "$TASK" = pusht ]; then
   SIDECAR="$PI_LTC_PUSHT_SIDECAR"
   EXPECTED_SOURCE_BYTES=46300921856
   EXPECTED_SIDECAR_BYTES=192116437
-  PI_RUN="pusht_jepa_wm_pi_ltc_5pass_seed3072"
-  VANILLA_RUN="pusht_jepa_wm_vanilla_5pass_seed3072"
+  PI_RUN="pusht_jepa_wm_pi_ltc_5pass_v2_seed3072"
+  VANILLA_RUN="pusht_jepa_wm_vanilla_5pass_v2_seed3072"
 else
   export PI_LTC_CUBE_SOURCE="${PI_LTC_CUBE_SOURCE:-/root/autodl-tmp/lewm_data/ogbench/cube_single_expert.h5}"
   export PI_LTC_CUBE_SIDECAR="${PI_LTC_CUBE_SIDECAR:-/root/autodl-tmp/lewm_data/ogbench/cube_counterfactual_cem0_seed3072.h5}"
@@ -54,8 +60,8 @@ else
   SIDECAR="$PI_LTC_CUBE_SIDECAR"
   EXPECTED_SOURCE_BYTES=101942558720
   EXPECTED_SIDECAR_BYTES=1282198884
-  PI_RUN="cube_jepa_wm_pi_ltc_5pass_seed3072"
-  VANILLA_RUN="cube_jepa_wm_vanilla_5pass_seed3072"
+  PI_RUN="cube_jepa_wm_pi_ltc_5pass_v2_seed3072"
+  VANILLA_RUN="cube_jepa_wm_vanilla_5pass_v2_seed3072"
 fi
 
 if [ "$NO_FILE_SCAN" = 1 ]; then
@@ -214,6 +220,49 @@ echo "[preflight PASS] task=$TASK data=$DATA_AUDIT model=$MODEL_AUDIT evaluator=
 fi
 if [ "${PREFLIGHT_ONLY:-1}" = 1 ]; then
   echo "[preflight only] Set PREFLIGHT_ONLY=0 only after reviewing all audits."
+  exit 0
+fi
+
+if [ "$CANARY_OPTIMIZER_STEPS" -gt 0 ]; then
+  CANARY_RUN="${PI_RUN}_canary${CANARY_OPTIMIZER_STEPS}_${EXPECTED_COMMIT:0:12}"
+  CANARY_DIR="$JEPAWM_LOGS/pi_ltc_cross_model/$CANARY_RUN"
+  CANARY_CONFIG="$CANARY_DIR/pi_canary_config.yaml"
+  python - "$PI_CONFIG" "$CANARY_CONFIG" "$CANARY_DIR" "$CANARY_OPTIMIZER_STEPS" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+source, destination, folder, optimizer_steps = sys.argv[1:]
+config = yaml.safe_load(Path(source).read_text(encoding="utf-8"))
+config["folder"] = folder
+config["meta"]["canary_optimizer_steps"] = int(optimizer_steps)
+config["meta"]["load_checkpoint"] = False
+config["meta"]["read_checkpoint"] = None
+config["meta"]["pretrained_path"] = None
+payload = yaml.safe_dump(config, sort_keys=False).encode("utf-8")
+path = Path(destination)
+if path.exists():
+    if path.read_bytes() != payload:
+        raise SystemExit(f"[STOP] immutable canary config differs: {path}")
+else:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(payload)
+    os.replace(temporary, path)
+print(f"[canary config] {path}")
+PY
+  mkdir -p "$CANARY_DIR/logs"
+  CANARY_LOG="$CANARY_DIR/logs/${TASK}_pi_canary_$(date +%Y%m%d_%H%M%S).log"
+  echo "[canary launch] task=$TASK optimizer_steps=$CANARY_OPTIMIZER_STEPS config=$CANARY_CONFIG"
+  set +e
+  python -m app.main --fname "$CANARY_CONFIG" --devices cuda:0 --debug 2>&1 | tee "$CANARY_LOG"
+  CANARY_RC=${PIPESTATUS[0]}
+  set -e
+  test "$CANARY_RC" -eq 0 || fail "canary returned status=$CANARY_RC"
+  test -f "$CANARY_DIR/canary_summary.json" || fail "canary summary is missing"
+  echo "[canary complete] summary=$CANARY_DIR/canary_summary.json"
   exit 0
 fi
 

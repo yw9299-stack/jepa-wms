@@ -18,6 +18,9 @@ from einops import rearrange, repeat
 from tensordict import TensorDict
 from tqdm import tqdm
 
+from app.vjepa_wm.planner_landscape import (
+    clip_grad_norm_with_isolated_parameters,
+)
 from src.utils.logging import grad_logger
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -711,15 +714,25 @@ class VideoWM(nn.Module):
         else:
             loss.backward()
 
-    def optimization_step(self):
+    def optimization_step(self, separately_clipped_parameters=None):
         """
         Copy-paste from TrainableModel class
         """
         self.scaler.unscale_(self.optimizer)
+        _separate_grad_norm = None
         if self.clip_grad > 0:
-            _grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.clip_grad)
-            if self.use_radamw and (_grad_norm > self.clip_grad):
-                logger.info(f"Gradient spike... skipping update {_grad_norm=}")
+            if separately_clipped_parameters:
+                _grad_norm, _separate_grad_norm = clip_grad_norm_with_isolated_parameters(
+                    self.parameters(),
+                    separately_clipped_parameters,
+                    self.clip_grad,
+                )
+                _skip_grad_norm = torch.maximum(_grad_norm, _separate_grad_norm)
+            else:
+                _grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.clip_grad)
+                _skip_grad_norm = _grad_norm
+            if self.use_radamw and (_skip_grad_norm > self.clip_grad):
+                logger.info(f"Gradient spike... skipping update {_skip_grad_norm=}")
                 self.optimizer.skip_step()
         if self.mixed_precision:
             self.scaler.step(self.optimizer)
@@ -729,6 +742,11 @@ class VideoWM(nn.Module):
         if self.clip_grad > 0:
             grad_stats = grad_logger(self.named_parameters())
             grad_stats.global_norm = float(_grad_norm)
+            grad_stats.separate_global_norm = (
+                None
+                if _separate_grad_norm is None
+                else float(_separate_grad_norm)
+            )
         else:
             grad_stats = None
         self.optimizer.zero_grad()

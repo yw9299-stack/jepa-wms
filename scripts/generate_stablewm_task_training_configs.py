@@ -19,8 +19,8 @@ BASE_CONFIG = Path("configs/pi_ltc_cross_model/pointmaze_jepa_wm_pi_ltc_5pass.ya
 
 TASKS = {
     "pusht": {
-        "pi_run": "pusht_jepa_wm_pi_ltc_5pass_seed3072",
-        "vanilla_run": "pusht_jepa_wm_vanilla_5pass_seed3072",
+        "pi_run": "pusht_jepa_wm_pi_ltc_5pass_v2_seed3072",
+        "vanilla_run": "pusht_jepa_wm_vanilla_5pass_v2_seed3072",
         "source_env": "PI_LTC_PUSHT_SOURCE",
         "sidecar_env": "PI_LTC_PUSHT_SIDECAR",
         "proprio_keys": ["proprio"],
@@ -35,8 +35,8 @@ TASKS = {
         "sidecar_config_sha256": "35b55bbd2cdfde01ae133fe86254dc720116885c69e31165bf3abdb08fc5659b",
     },
     "cube": {
-        "pi_run": "cube_jepa_wm_pi_ltc_5pass_seed3072",
-        "vanilla_run": "cube_jepa_wm_vanilla_5pass_seed3072",
+        "pi_run": "cube_jepa_wm_pi_ltc_5pass_v2_seed3072",
+        "vanilla_run": "cube_jepa_wm_vanilla_5pass_v2_seed3072",
         "source_env": "PI_LTC_CUBE_SOURCE",
         "sidecar_env": "PI_LTC_CUBE_SIDECAR",
         "proprio_keys": [
@@ -122,6 +122,9 @@ def derive_task_configs(base: dict, task: str) -> tuple[dict, dict]:
             "expected_groups": 10000,
             "expected_branches_per_group": 4,
             "expected_config_sha256": spec["sidecar_config_sha256"],
+            "target_energy_eps": 1.0e-8,
+            "target_energy_eligibility": "strictly_greater_than_eps",
+            "gradient_clip_ownership": "separate_transition_and_scale",
         }
     )
 
@@ -173,7 +176,7 @@ def main() -> int:
     spec = TASKS[args.task]
     manifest = {
         "schema_version": 1,
-        "protocol": f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_5pass_v1",
+        "protocol": f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_5pass_v2",
         "repository_commit": commit,
         "repository_tracked_dirty": dirty,
         "content_hash_mode": os.environ.get("PI_LTC_CONTENT_HASH_MODE", "sha256"),

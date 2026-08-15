@@ -28,14 +28,14 @@ if [ "$TASK" = pusht ]; then
   SOURCE="${PI_LTC_PUSHT_SOURCE:-/root/autodl-tmp/lewm_data/pusht_expert_train.h5}"
   SOURCE_SHA="${PI_LTC_PUSHT_SOURCE_SHA256:?set PI_LTC_PUSHT_SOURCE_SHA256}"
   SIDECAR_SHA="${PI_LTC_PUSHT_SIDECAR_SHA256:?set PI_LTC_PUSHT_SIDECAR_SHA256}"
-  PI_RUN=pusht_jepa_wm_pi_ltc_5pass_seed3072
-  VANILLA_RUN=pusht_jepa_wm_vanilla_5pass_seed3072
+  PI_RUN=pusht_jepa_wm_pi_ltc_5pass_v2_seed3072
+  VANILLA_RUN=pusht_jepa_wm_vanilla_5pass_v2_seed3072
 else
   SOURCE="${PI_LTC_CUBE_SOURCE:-/root/autodl-tmp/lewm_data/ogbench/cube_single_expert.h5}"
   SOURCE_SHA="${PI_LTC_CUBE_SOURCE_SHA256:?set PI_LTC_CUBE_SOURCE_SHA256}"
   SIDECAR_SHA="${PI_LTC_CUBE_SIDECAR_SHA256:?set PI_LTC_CUBE_SIDECAR_SHA256}"
-  PI_RUN=cube_jepa_wm_pi_ltc_5pass_seed3072
-  VANILLA_RUN=cube_jepa_wm_vanilla_5pass_seed3072
+  PI_RUN=cube_jepa_wm_pi_ltc_5pass_v2_seed3072
+  VANILLA_RUN=cube_jepa_wm_vanilla_5pass_v2_seed3072
 fi
 
 PI_DIR="$JEPAWM_LOGS/pi_ltc_cross_model/$PI_RUN"

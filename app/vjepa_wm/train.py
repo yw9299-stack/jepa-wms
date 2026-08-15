@@ -6,6 +6,7 @@
 #
 
 import hashlib
+import json
 import os
 import random
 import subprocess
@@ -148,6 +149,9 @@ def main(args, resume_preempt=False):
     light_eval_freq = cfgs_meta.get("light_eval_freq", 100)
     save_every_freq = cfgs_meta.get("save_every_freq", -1)
     quick_debug = cfgs_meta.get("quick_debug", False)
+    canary_optimizer_steps = int(cfgs_meta.get("canary_optimizer_steps", 0) or 0)
+    if canary_optimizer_steps < 0:
+        raise ValueError("meta.canary_optimizer_steps must be non-negative")
     which_dtype = cfgs_meta.get("dtype")
     logger.info(f"⚙️  Using dtype: {which_dtype}")
     if which_dtype.lower() == "bfloat16":
@@ -533,6 +537,19 @@ def main(args, resume_preempt=False):
         f"dropped_tail_microbatches={dropped_microbatches}"
     )
     logger.info(f"📊 Iterations per epoch: {ipe} (dataset size: {_dlen})")
+    if canary_optimizer_steps:
+        if not planner_identified_enabled:
+            raise ValueError("canary_optimizer_steps requires planner-identified training")
+        if canary_optimizer_steps >= optimizer_steps_per_epoch:
+            raise ValueError(
+                "canary_optimizer_steps must be shorter than one physical pass: "
+                f"requested={canary_optimizer_steps}, pass={optimizer_steps_per_epoch}"
+            )
+        logger.info(
+            "PI canary enabled: "
+            f"optimizer_steps={canary_optimizer_steps}, "
+            f"microbatches={canary_optimizer_steps * gradient_accumulation_steps}"
+        )
     if main_optimizer == "transition_model":
         cfgs_opt["transition_model"]["iterations_per_epoch"] = optimizer_steps_per_epoch
     elif main_optimizer == "image_head":
@@ -636,9 +653,20 @@ def main(args, resume_preempt=False):
                 self.job_set = set()
 
         def log(self, epoch, itr, losses, total_stats, eval_losses=None, eval_total_stats=None, image_stats=None):
+            microbatch_in_epoch = itr + 1
+            optimizer_step_in_epoch = microbatch_in_epoch // gradient_accumulation_steps
             log_dict = {
                 "epoch": epoch + 1,
                 "itr": itr,
+                "microbatch_in_epoch": microbatch_in_epoch,
+                "microbatches_per_epoch": ipe,
+                "optimizer_step_in_epoch": optimizer_step_in_epoch,
+                "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+                "total_microbatch_step": epoch * ipe + microbatch_in_epoch,
+                "total_optimizer_step": (
+                    epoch * optimizer_steps_per_epoch + optimizer_step_in_epoch
+                ),
+                "epoch_progress": microbatch_in_epoch / ipe,
             }
             for key, value in losses.items():
                 if isinstance(value, torch.Tensor):
@@ -660,7 +688,20 @@ def main(args, resume_preempt=False):
                 if not self.disable_wandb_media:
                     log_dict.update(image_stats)
             if "loss" in log_dict.keys() and itr % log_freq == 0:
-                logger.info("[%d, %5d] " "loss: %.3f | " % (epoch + 1, itr, log_dict["loss"]))
+                logger.info(
+                    "[epoch %d/%d | opt %d/%d | micro %d/%d | %.1f%%] "
+                    "loss: %.3f | "
+                    % (
+                        epoch + 1,
+                        num_epochs,
+                        optimizer_step_in_epoch,
+                        optimizer_steps_per_epoch,
+                        microbatch_in_epoch,
+                        ipe,
+                        100.0 * microbatch_in_epoch / ipe,
+                        log_dict["loss"],
+                    )
+                )
             if self.use_wandb and rank == 0:
                 wandb.log(log_dict)
 
@@ -847,6 +888,8 @@ def main(args, resume_preempt=False):
                 wd_scheduler.step()
         if light_eval_only_mode:
             start_epoch -= 1
+    if canary_optimizer_steps and start_epoch != 0:
+        raise RuntimeError("PI canary must start from the canonical epoch-0 initialization")
 
     # Load pretrained heads from pretrain_dec_path
     if pretrain_dec_path is not None:
@@ -932,8 +975,15 @@ def main(args, resume_preempt=False):
         planner_last_stats = {
             "planner_landscape_loss": zero,
             "planner_pairwise_sign_accuracy": zero,
+            "planner_valid_pairwise_sign_accuracy": zero,
             "planner_predicted_cost_std": zero,
             "planner_real_cost_std": zero,
+            "planner_valid_group_count": zero,
+            "planner_valid_group_fraction": zero,
+            "planner_target_energy_min": zero,
+            "planner_target_energy_median": zero,
+            "planner_target_energy_max": zero,
+            "planner_target_energy_eps": zero,
             "planner_scale": scale_module.input_scale.detach(),
             "planner_log_scale": scale_module.log_scale.detach(),
             "planner_scale_gradient": zero,
@@ -1084,6 +1134,11 @@ def main(args, resume_preempt=False):
 
     # -- TRAINING LOOP
     if not (plan_only_eval_mode or unroll_decode_eval_only_mode):
+        canary_complete = False
+        canary_valid_fraction_meter = AverageMeter()
+        canary_landscape_loss_meter = AverageMeter()
+        canary_sign_accuracy_meter = AverageMeter()
+        canary_scale_gradient_abs_meter = AverageMeter()
         for epoch in range(start_epoch, num_epochs):
             logger.info("\n" + "─" * 50)
             logger.info(f"📈 Epoch {epoch + 1}/{num_epochs}")
@@ -1115,6 +1170,11 @@ def main(args, resume_preempt=False):
                         epoch * optimizer_steps_per_epoch + (itr + 1) // gradient_accumulation_steps
                     )
                     rates["info/transition_model/microbatch_step"] = epoch * ipe + itr + 1
+                    rates["info/transition_model/optimizer_step_in_epoch"] = (
+                        (itr + 1) // gradient_accumulation_steps
+                    )
+                    rates["info/transition_model/microbatch_in_epoch"] = itr + 1
+                    rates["info/transition_model/epoch_progress"] = (itr + 1) / ipe
                     if train:
                         if train_predictor and optimizer_boundary:
                             rates["info/transition_model/lr"] = scheduler.step()
@@ -1376,6 +1436,12 @@ def main(args, resume_preempt=False):
                                         device=device,
                                         dtype=dtype,
                                         mixed_precision=mixed_precision,
+                                        target_energy_eps=float(
+                                            cfgs_planner_identified.get(
+                                                "target_energy_eps",
+                                                1.0e-8,
+                                            )
+                                        ),
                                     )
                                     planner_last_stats.update(planner_result.stats)
                                     total_stats.update(planner_last_stats)
@@ -1387,7 +1453,21 @@ def main(args, resume_preempt=False):
                                 (
                                     grad_stats["transition_model"],
                                     optim_stats["transition_model"],
-                                ) = world_model.optimization_step()
+                                ) = world_model.optimization_step(
+                                    separately_clipped_parameters=(
+                                        (planner_input_scale(world_model).log_scale,)
+                                        if planner_identified_enabled
+                                        else None
+                                    )
+                                )
+                                transition_grad_stats = grad_stats["transition_model"]
+                                if (
+                                    planner_identified_enabled
+                                    and transition_grad_stats is not None
+                                ):
+                                    total_stats[
+                                        "optim/planner_scale/grad_norm_before_clip"
+                                    ] = transition_grad_stats.separate_global_norm
                         for key in list(grad_stats.keys()):
                             grad_stats[f"optim/{key}/grad_norm"] = (
                                 grad_stats[key].global_norm if grad_stats[key] is not None else 0.0
@@ -1629,6 +1709,23 @@ def main(args, resume_preempt=False):
                     loss_meter.update(loss)
                     gpu_time_meter.update(gpu_etime_ms)
                     wall_time_meter.update(iter_elapsed_time_ms)
+                    if (
+                        canary_optimizer_steps
+                        and planner_identified_enabled
+                        and (itr + 1) % gradient_accumulation_steps == 0
+                    ):
+                        canary_valid_fraction_meter.update(
+                            float(total_stats["planner_valid_group_fraction"])
+                        )
+                        canary_landscape_loss_meter.update(
+                            float(losses["planner_landscape_loss"])
+                        )
+                        canary_sign_accuracy_meter.update(
+                            float(total_stats["planner_valid_pairwise_sign_accuracy"])
+                        )
+                        canary_scale_gradient_abs_meter.update(
+                            abs(float(total_stats["planner_scale_gradient"]))
+                        )
                     if train_csv_logger is None:  # Initialize the logger once
                         train_csv_logger = create_csv_logger(losses, total_stats, train=True)
                 else:
@@ -1696,13 +1793,18 @@ def main(args, resume_preempt=False):
                         train_csv_logger.log(*log_values)
                         if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                             logger.info(
-                                "[%d, %5d] "
+                                "[epoch %d/%d | opt %d/%d | micro %d/%d | %.1f%%] "
                                 "[mem: %.2e] "
                                 "[gpu: %.1f ms]"
                                 "[wall: %.1f ms]"
                                 % (
                                     epoch + 1,
-                                    itr,
+                                    num_epochs,
+                                    (itr + 1) // gradient_accumulation_steps,
+                                    optimizer_steps_per_epoch,
+                                    itr + 1,
+                                    ipe,
+                                    100.0 * (itr + 1) / ipe,
                                     torch.cuda.max_memory_allocated() / 1024.0**2,
                                     gpu_time_meter.avg,
                                     wall_time_meter.avg,
@@ -1723,7 +1825,68 @@ def main(args, resume_preempt=False):
                 log_stats()
                 if not light_eval_only_mode:
                     assert not np.isnan(loss), "loss is nan"
+                if (
+                    canary_optimizer_steps
+                    and (itr + 1) % gradient_accumulation_steps == 0
+                    and (itr + 1) // gradient_accumulation_steps
+                    >= canary_optimizer_steps
+                ):
+                    canary_complete = True
+                    break
             logger.info("avg. loss %.3f" % loss_meter.avg)
+
+            if canary_complete:
+                if rank == 0:
+                    scale = planner_input_scale(world_model)
+                    summary = {
+                        "status": "CANARY_COMPLETE",
+                        "optimizer_steps": canary_optimizer_steps,
+                        "microbatches": (
+                            canary_optimizer_steps * gradient_accumulation_steps
+                        ),
+                        "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+                        "microbatches_per_epoch": ipe,
+                        "gradient_accumulation_steps": gradient_accumulation_steps,
+                        "target_energy_eps": float(
+                            cfgs_planner_identified.get(
+                                "target_energy_eps",
+                                1.0e-8,
+                            )
+                        ),
+                        "final_log_scale": float(scale.log_scale.detach().cpu()),
+                        "final_scale": float(scale.input_scale.detach().cpu()),
+                        "valid_group_fraction": {
+                            "mean": canary_valid_fraction_meter.avg,
+                            "min": canary_valid_fraction_meter.min,
+                            "max": canary_valid_fraction_meter.max,
+                        },
+                        "planner_landscape_loss": {
+                            "mean": canary_landscape_loss_meter.avg,
+                            "min": canary_landscape_loss_meter.min,
+                            "max": canary_landscape_loss_meter.max,
+                        },
+                        "planner_valid_pairwise_sign_accuracy_mean": (
+                            canary_sign_accuracy_meter.avg
+                        ),
+                        "planner_scale_gradient_abs": {
+                            "mean": canary_scale_gradient_abs_meter.avg,
+                            "max": canary_scale_gradient_abs_meter.max,
+                        },
+                        "repository_commit": (
+                            training_provenance.get("repository_commit")
+                            if training_provenance is not None
+                            else None
+                        ),
+                    }
+                    summary_path = Path(folder) / "canary_summary.json"
+                    temporary_path = summary_path.with_suffix(".json.tmp")
+                    temporary_path.write_text(
+                        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    temporary_path.replace(summary_path)
+                    logger.info(f"[CANARY COMPLETE] summary={summary_path}")
+                break
 
             # -- Save Last
             if not light_eval_only_mode:

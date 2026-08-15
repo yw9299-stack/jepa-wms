@@ -27,6 +27,18 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
                     pi["planner_identified"]["expected_config_sha256"],
                     spec["sidecar_config_sha256"],
                 )
+                self.assertEqual(
+                    pi["planner_identified"]["target_energy_eps"],
+                    1.0e-8,
+                )
+                self.assertEqual(
+                    pi["planner_identified"]["target_energy_eligibility"],
+                    "strictly_greater_than_eps",
+                )
+                self.assertEqual(
+                    pi["planner_identified"]["gradient_clip_ownership"],
+                    "separate_transition_and_scale",
+                )
 
     def test_vanilla_restores_exact_pi_config(self):
         for task in TASKS:

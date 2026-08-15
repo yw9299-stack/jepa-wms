@@ -23,14 +23,110 @@ def pairwise_cost_differences(cost):
     return cost.index_select(1, pair_i) - cost.index_select(1, pair_j)
 
 
-def normalized_pairwise_landscape_error(predicted_cost, real_cost, eps=1.0e-8):
+def normalized_pairwise_landscape_error(
+    predicted_cost,
+    real_cost,
+    eps=1.0e-8,
+    *,
+    return_diagnostics=False,
+):
+    """Return the normalized landscape error over numerically identifiable groups.
+
+    A group's normalization energy is the mean squared realized pairwise cost
+    difference.  When that energy is at or below the existing denominator
+    guard, the realized candidate order is not numerically identifiable.  Such
+    groups must not own a scale gradient: replacing their denominator by
+    ``eps`` would turn representation noise into an arbitrarily large relative
+    error.  Every identifiable group retains the exact previous objective.
+    """
+
     if predicted_cost.shape != real_cost.shape:
         raise ValueError("predicted and real planner costs must have identical shapes")
+    if not torch.isfinite(torch.tensor(float(eps))) or float(eps) <= 0.0:
+        raise ValueError("eps must be finite and positive")
     predicted_difference = pairwise_cost_differences(predicted_cost)
     real_difference = pairwise_cost_differences(real_cost.detach())
     numerator = (predicted_difference - real_difference).square().mean(dim=1)
-    denominator = real_difference.square().mean(dim=1).clamp_min(float(eps))
-    return (numerator / denominator).mean()
+    target_energy = real_difference.square().mean(dim=1)
+    valid_group = target_energy > float(eps)
+    valid_group_count = valid_group.sum()
+    if bool(valid_group.any()):
+        loss = (numerator[valid_group] / target_energy[valid_group]).mean()
+    else:
+        # Preserve a zero gradient path to predicted_cost/log_scale so callers
+        # can safely use autograd.grad without special-casing an empty batch.
+        loss = predicted_difference.sum() * 0.0
+
+    if not return_diagnostics:
+        return loss
+    diagnostics = {
+        "valid_group": valid_group,
+        "valid_group_count": valid_group_count,
+        "valid_group_fraction": valid_group.float().mean(),
+        "target_energy": target_energy,
+        "target_energy_min": target_energy.min(),
+        "target_energy_median": target_energy.median(),
+        "target_energy_max": target_energy.max(),
+    }
+    return loss, diagnostics
+
+
+def clip_grad_norm_with_isolated_parameters(
+    parameters,
+    isolated_parameters,
+    max_norm,
+):
+    """Clip ordinary and planner-owned gradients without cross-coupling.
+
+    Joint norm clipping lets a large planner-scale gradient shrink ordinary
+    transition gradients even though the planner objective has no graph to the
+    transition model.  Returning both pre-clip norms keeps that separation
+    explicit and auditable.
+    """
+
+    parameters = tuple(parameters)
+    isolated_parameters = tuple(isolated_parameters)
+    isolated_ids = {id(parameter) for parameter in isolated_parameters}
+    if len(isolated_ids) != len(isolated_parameters):
+        raise ValueError("isolated_parameters contains duplicate parameters")
+    if any(not any(parameter is candidate for candidate in parameters) for parameter in isolated_parameters):
+        raise ValueError("every isolated parameter must belong to parameters")
+
+    ordinary_parameters = tuple(
+        parameter
+        for parameter in parameters
+        if id(parameter) not in isolated_ids
+    )
+    ordinary_grad_parameters = tuple(
+        parameter for parameter in ordinary_parameters if parameter.grad is not None
+    )
+    isolated_grad_parameters = tuple(
+        parameter for parameter in isolated_parameters if parameter.grad is not None
+    )
+
+    reference = next(
+        (
+            parameter
+            for parameter in parameters
+            if parameter.grad is not None
+        ),
+        parameters[0] if parameters else None,
+    )
+    if reference is None:
+        zero = torch.tensor(0.0)
+    else:
+        zero = reference.new_tensor(0.0)
+    ordinary_norm = (
+        torch.nn.utils.clip_grad_norm_(ordinary_grad_parameters, max_norm)
+        if ordinary_grad_parameters
+        else zero
+    )
+    isolated_norm = (
+        torch.nn.utils.clip_grad_norm_(isolated_grad_parameters, max_norm)
+        if isolated_grad_parameters
+        else zero
+    )
+    return ordinary_norm, isolated_norm
 
 
 def pairwise_sign_accuracy(predicted_cost, real_cost):
@@ -102,7 +198,15 @@ class PlannerLandscapeResult:
     stats: dict
 
 
-def planner_landscape_result(world_model, batch, *, device, dtype, mixed_precision):
+def planner_landscape_result(
+    world_model,
+    batch,
+    *,
+    device,
+    dtype,
+    mixed_precision,
+    target_energy_eps=1.0e-8,
+):
     """Compute the landscape objective and its gradient only for log(scale).
 
     ``torch.autograd.grad`` explicitly requests the single calibration
@@ -145,7 +249,12 @@ def planner_landscape_result(world_model, batch, *, device, dtype, mixed_precisi
                 (predicted.float() - repeated_goal.float()).square().flatten(1).mean(dim=1).reshape(groups, candidates)
             )
             real_cost = (next_features.float() - goal_features.float()).square().flatten(2).mean(dim=2)
-            loss = normalized_pairwise_landscape_error(predicted_cost, real_cost)
+            loss, landscape_diagnostics = normalized_pairwise_landscape_error(
+                predicted_cost,
+                real_cost,
+                eps=target_energy_eps,
+                return_diagnostics=True,
+            )
 
         scale_gradient = torch.autograd.grad(
             loss,
@@ -160,11 +269,28 @@ def planner_landscape_result(world_model, batch, *, device, dtype, mixed_precisi
 
     predicted_std = predicted_cost.detach().std(dim=1).mean()
     real_std = real_cost.detach().std(dim=1).mean()
+    valid_group = landscape_diagnostics["valid_group"]
+    if bool(valid_group.any()):
+        valid_sign_accuracy = pairwise_sign_accuracy(
+            predicted_cost[valid_group],
+            real_cost[valid_group],
+        )
+    else:
+        valid_sign_accuracy = predicted_cost.new_tensor(0.0)
     stats = {
         "planner_landscape_loss": loss.detach(),
         "planner_pairwise_sign_accuracy": pairwise_sign_accuracy(predicted_cost, real_cost),
+        "planner_valid_pairwise_sign_accuracy": valid_sign_accuracy,
         "planner_predicted_cost_std": predicted_std,
         "planner_real_cost_std": real_std,
+        "planner_valid_group_count": landscape_diagnostics["valid_group_count"].float(),
+        "planner_valid_group_fraction": landscape_diagnostics["valid_group_fraction"],
+        "planner_target_energy_min": landscape_diagnostics["target_energy_min"],
+        "planner_target_energy_median": landscape_diagnostics["target_energy_median"],
+        "planner_target_energy_max": landscape_diagnostics["target_energy_max"],
+        "planner_target_energy_eps": predicted_cost.new_tensor(
+            float(target_energy_eps)
+        ),
         "planner_scale": scale.input_scale.detach(),
         "planner_log_scale": scale.log_scale.detach(),
         "planner_scale_gradient": scale_gradient,
