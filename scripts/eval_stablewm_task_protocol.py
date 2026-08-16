@@ -26,6 +26,9 @@ from app.vjepa_wm.modelcustom.stablewm_pointmaze_cost import (  # noqa: E402
     build_stablewm_pointmaze_cost,
 )
 from scripts.generate_stablewm_task_training_configs import TASKS  # noqa: E402
+from scripts.stablewm_checkpoint_selection import (  # noqa: E402
+    expected_checkpoint_schedule,
+)
 
 
 TASK_PROTOCOLS = {
@@ -180,6 +183,7 @@ def _checkpoint_audit(
     sidecar_sha256: str,
     expected_optimizer_steps_per_epoch: int,
     expected_optimizer_step_budget: int,
+    expected_completed_passes: int | None = None,
     smoke: bool = False,
 ) -> dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
@@ -195,23 +199,31 @@ def _checkpoint_audit(
         if not isinstance(provenance, dict):
             raise RuntimeError("checkpoint lacks strict training provenance")
         if provenance.get("repository_commit") != expected_commit:
-            raise RuntimeError("checkpoint repository commit differs from evaluator commit")
+            raise RuntimeError("checkpoint repository commit differs from expected training commit")
         if provenance.get("source_h5", {}).get("sha256") != source_sha256:
             raise RuntimeError("checkpoint source SHA-256 differs")
         if provenance.get("sidecar_h5", {}).get("sha256") != sidecar_sha256:
             raise RuntimeError("checkpoint sidecar SHA-256 differs")
         if checkpoint.get("optimizer_steps_per_epoch") != expected_optimizer_steps_per_epoch:
             raise RuntimeError("checkpoint optimizer-step schedule differs")
-        completed_passes, partial_pass_steps = divmod(
-            expected_optimizer_step_budget,
-            expected_optimizer_steps_per_epoch,
-        )
         if checkpoint.get("optimizer_step_budget") != expected_optimizer_step_budget:
             raise RuntimeError("checkpoint optimizer-step budget differs")
-        if checkpoint.get("total_optimizer_steps") != expected_optimizer_step_budget:
+        try:
+            expected_schedule = expected_checkpoint_schedule(
+                optimizer_steps_per_pass=expected_optimizer_steps_per_epoch,
+                configured_optimizer_step_budget=expected_optimizer_step_budget,
+                expected_completed_passes=expected_completed_passes,
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        completed_passes = expected_schedule["epoch"]
+        partial_pass_steps = expected_schedule["optimizer_step_in_epoch"]
+        expected_total_optimizer_steps = expected_schedule["total_optimizer_steps"]
+        expected_training_complete = expected_schedule["training_complete"]
+        if checkpoint.get("total_optimizer_steps") != expected_total_optimizer_steps:
             raise RuntimeError("checkpoint total optimizer-step count differs")
-        if checkpoint.get("training_complete") is not True:
-            raise RuntimeError("checkpoint is not marked training-complete")
+        if (checkpoint.get("training_complete") is True) != expected_training_complete:
+            raise RuntimeError("checkpoint training-complete state differs")
         if int(checkpoint.get("epoch", -1)) != completed_passes:
             raise RuntimeError("checkpoint completed-pass count differs")
         if int(checkpoint.get("optimizer_step_in_epoch", -1)) != partial_pass_steps:
@@ -232,6 +244,8 @@ def _checkpoint_audit(
         "optimizer_step_budget": int(checkpoint.get("optimizer_step_budget", 0)),
         "optimizer_step_in_epoch": int(checkpoint.get("optimizer_step_in_epoch", 0)),
         "training_complete": checkpoint.get("training_complete") is True,
+        "selection_policy": ("configured_final_horizon" if smoke else expected_schedule["selection_policy"]),
+        "selected_completed_passes": int(checkpoint["epoch"]),
         "scale_keys": scale_keys,
         "training_provenance": provenance,
         "common_trainable_initialization_sha256": initialization_sha256,
@@ -256,11 +270,14 @@ def main() -> int:
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--candidate-chunk-size", type=int, default=32)
     parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-training-commit")
     parser.add_argument("--expected-lewm-commit", required=True)
+    parser.add_argument("--expected-completed-passes", type=int)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--reuse-complete", action="store_true")
     args = parser.parse_args()
+    expected_training_commit = args.expected_training_commit or args.expected_commit
 
     if args.owner == "pi" and args.arm not in {"learned", "identity", "fixed06", "fixed04"}:
         raise SystemExit("[STOP] invalid PI arm")
@@ -298,7 +315,7 @@ def main() -> int:
     if (
         preflight_audit.get("status") != "PASS"
         or preflight_audit.get("task") != args.task
-        or preflight_audit.get("repository_commit") != args.expected_commit
+        or preflight_audit.get("repository_commit") != expected_training_commit
         or source_audit.get("path") != str(source_h5)
         or source_audit.get("bytes") != source_stat.st_size
         or source_audit.get("mtime_ns") != source_stat.st_mtime_ns
@@ -328,11 +345,12 @@ def main() -> int:
     checkpoint_audit = _checkpoint_audit(
         checkpoint_path,
         owner=args.owner,
-        expected_commit=args.expected_commit,
+        expected_commit=expected_training_commit,
         source_sha256=args.source_sha256,
         sidecar_sha256=args.sidecar_sha256,
         expected_optimizer_steps_per_epoch=expected_optimizer_steps_per_epoch,
         expected_optimizer_step_budget=expected_optimizer_step_budget,
+        expected_completed_passes=args.expected_completed_passes,
         smoke=args.smoke,
     )
     arm_root = (
@@ -354,6 +372,8 @@ def main() -> int:
             == checkpoint_audit["sha256"]
             and existing.get("source_h5", {}).get("sha256") == args.source_sha256
             and existing.get("repository_commit") == args.expected_commit
+            and existing.get("training_repository_commit")
+            == expected_training_commit
             and existing.get("lewm_repository_commit") == args.expected_lewm_commit
             and len(existing.get("results", {}).get("episode_successes", []))
             == args.episodes
@@ -510,6 +530,7 @@ def main() -> int:
             "sha256": args.source_sha256,
         },
         "repository_commit": _git_commit(repository),
+        "training_repository_commit": expected_training_commit,
         "lewm_repository_commit": _git_commit(lewm_repo),
         "evaluation": {
             "environment": TASK_PROTOCOLS[args.task]["environment"],
