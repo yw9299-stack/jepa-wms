@@ -67,6 +67,25 @@ class TestStableWmTaskSummary(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "environment_state_sha256 differs"):
             summarize(self.root, "pusht", draws=20, bootstrap_seed=7)
 
+    def test_heldout_selection_requires_the_same_pass_for_every_arm(self):
+        for path in self.root.rglob("arm_audit.json"):
+            audit = json.loads(path.read_text())
+            audit["checkpoint_selection_protocol"] = "heldout_complete_pass_v1"
+            audit["checkpoint"]["selected_completed_passes"] = 1
+            path.write_text(json.dumps(audit))
+        mismatched = (
+            self.root
+            / "pusht"
+            / "seed44"
+            / "vanilla_stepmatched"
+            / "arm_audit.json"
+        )
+        audit = json.loads(mismatched.read_text())
+        audit["checkpoint"]["selected_completed_passes"] = 2
+        mismatched.write_text(json.dumps(audit))
+        with self.assertRaisesRegex(ValueError, "selected pass differs"):
+            summarize(self.root, "pusht", draws=20, bootstrap_seed=7)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,11 +51,12 @@ if [ "$TASK" = pusht ]; then
   SIDECAR="$PI_LTC_PUSHT_SIDECAR"
   EXPECTED_SOURCE_BYTES=46300921856
   EXPECTED_SIDECAR_BYTES=192116437
-  PI_RUN="pusht_jepa_wm_pi_ltc_step111464_v4_seed3072"
-  VANILLA_RUN="pusht_jepa_wm_vanilla_step111464_v4_seed3072"
+  PI_RUN="pusht_jepa_wm_pi_ltc_step111464_v5_seed3072"
+  VANILLA_RUN="pusht_jepa_wm_vanilla_step111464_v5_seed3072"
   OPTIMIZER_STEP_BUDGET=111464
   LEWM_REFERENCE_PASSES=8
   DRIVER_EPOCHS=9
+  DEFAULT_TARGET_COMPLETE_PASSES=1
 else
   export PI_LTC_CUBE_SOURCE="${PI_LTC_CUBE_SOURCE:-/root/autodl-tmp/lewm_data/ogbench/cube_single_expert.h5}"
   export PI_LTC_CUBE_SIDECAR="${PI_LTC_CUBE_SIDECAR:-/root/autodl-tmp/lewm_data/ogbench/cube_counterfactual_cem0_seed3072.h5}"
@@ -63,14 +64,19 @@ else
   SIDECAR="$PI_LTC_CUBE_SIDECAR"
   EXPECTED_SOURCE_BYTES=101942558720
   EXPECTED_SIDECAR_BYTES=1282198884
-  PI_RUN="cube_jepa_wm_pi_ltc_step51184_v4_seed3072"
-  VANILLA_RUN="cube_jepa_wm_vanilla_step51184_v4_seed3072"
+  PI_RUN="cube_jepa_wm_pi_ltc_step51184_v5_seed3072"
+  VANILLA_RUN="cube_jepa_wm_vanilla_step51184_v5_seed3072"
   OPTIMIZER_STEP_BUDGET=51184
   LEWM_REFERENCE_PASSES=4
   DRIVER_EPOCHS=4
+  DEFAULT_TARGET_COMPLETE_PASSES=4
 fi
 
-echo "[LEWM-step-matched schedule] task=$TASK reference_passes=$LEWM_REFERENCE_PASSES optimizer_steps=$OPTIMIZER_STEP_BUDGET driver_epochs=$DRIVER_EPOCHS"
+TARGET_COMPLETE_PASSES="${TARGET_COMPLETE_PASSES:-$DEFAULT_TARGET_COMPLETE_PASSES}"
+[[ "$TARGET_COMPLETE_PASSES" =~ ^[1-9][0-9]*$ ]] || fail "TARGET_COMPLETE_PASSES must be a positive integer"
+test "$TARGET_COMPLETE_PASSES" -le "$LEWM_REFERENCE_PASSES" || fail "TARGET_COMPLETE_PASSES exceeds the configured complete-pass horizon"
+echo "[configured schedule] task=$TASK reference_passes=$LEWM_REFERENCE_PASSES optimizer_steps=$OPTIMIZER_STEP_BUDGET driver_epochs=$DRIVER_EPOCHS"
+echo "[runtime budget] stop cleanly after complete_passes=$TARGET_COMPLETE_PASSES (PushT default=1; set 2 to resume both matched arms through pass 2)"
 
 if [ "$NO_FILE_SCAN" = 1 ]; then
   # SHA-256 of the literal marker, not of either data file.  Provenance records
@@ -121,6 +127,83 @@ if [ "$NO_FILE_SCAN" = 1 ]; then
   echo "[source] path=$(realpath "$SOURCE") bytes=$(stat -c %s "$SOURCE")"
   echo "[sidecar] path=$(realpath "$SIDECAR") bytes=$(stat -c %s "$SIDECAR")"
   echo "[user override] skipping content hashes, standalone data preflight, unit/model preflight, and LEWM smoke"
+  python - "$TASK" "$EXPECTED_COMMIT" "$SOURCE" "$SIDECAR" "$SOURCE_SHA" "$SIDECAR_SHA" "$PI_CONFIG" "$VANILLA_CONFIG" "$DATA_AUDIT" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+(
+    task,
+    commit,
+    source_text,
+    sidecar_text,
+    source_sha,
+    sidecar_sha,
+    pi_config_text,
+    vanilla_config_text,
+    output_text,
+) = sys.argv[1:]
+source = Path(source_text).resolve()
+sidecar = Path(sidecar_text).resolve()
+pi_config = Path(pi_config_text).resolve()
+vanilla_config = Path(vanilla_config_text).resolve()
+output = Path(output_text)
+
+def sha256_small(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+pi = yaml.safe_load(pi_config.read_text(encoding="utf-8"))
+steps_per_pass = int(
+    pi["optimization"]["transition_model"][
+        "expected_optimizer_steps_per_epoch"
+    ]
+)
+audit = {
+    "status": "PASS",
+    "verification_mode": "not_scanned_user_confirmed",
+    "task": task,
+    "repository_commit": commit,
+    "training_configs": {
+        "pi": {"path": str(pi_config), "sha256": sha256_small(pi_config)},
+        "vanilla": {
+            "path": str(vanilla_config),
+            "sha256": sha256_small(vanilla_config),
+        },
+    },
+    "source": {
+        "path": str(source),
+        "bytes": source.stat().st_size,
+        "mtime_ns": source.stat().st_mtime_ns,
+        "sha256": source_sha,
+        "content_not_read": True,
+    },
+    "split": {
+        "optimizer_steps_per_pass": steps_per_pass,
+        "optimizer_step_budget": int(
+            pi["optimization"]["transition_model"]["total_optimizer_steps"]
+        ),
+    },
+    "planner": {
+        "sidecar_path": str(sidecar),
+        "sidecar_bytes": sidecar.stat().st_size,
+        "sidecar_mtime_ns": sidecar.stat().st_mtime_ns,
+        "sidecar_sha256": sidecar_sha,
+        "content_not_read": True,
+    },
+}
+payload = json.dumps(audit, indent=2, sort_keys=True) + "\n"
+output.parent.mkdir(parents=True, exist_ok=True)
+if output.exists() and output.read_text(encoding="utf-8") != payload:
+    raise SystemExit(f"[STOP] immutable located-only audit differs: {output}")
+temporary = output.with_suffix(output.suffix + ".tmp")
+temporary.write_text(payload, encoding="utf-8")
+os.replace(temporary, output)
+print(f"[located-only audit PASS] {output}")
+PY
 else
 reuse_data_preflight=0
 if [ -f "$DATA_AUDIT" ]; then
@@ -265,11 +348,18 @@ PY
   CANARY_LOG="$CANARY_DIR/logs/${TASK}_pi_canary_$(date +%Y%m%d_%H%M%S).log"
   echo "[canary launch] task=$TASK optimizer_steps=$CANARY_OPTIMIZER_STEPS config=$CANARY_CONFIG"
   set +e
-  python -m app.main --fname "$CANARY_CONFIG" --devices cuda:0 --debug 2>&1 | tee "$CANARY_LOG"
+  PI_LTC_STOP_AFTER_COMPLETE_PASSES=0 \
+    python -m app.main --fname "$CANARY_CONFIG" --devices cuda:0 --debug 2>&1 | tee "$CANARY_LOG"
   CANARY_RC=${PIPESTATUS[0]}
   set -e
   test "$CANARY_RC" -eq 0 || fail "canary returned status=$CANARY_RC"
   test -f "$CANARY_DIR/canary_summary.json" || fail "canary summary is missing"
+  python - "$CANARY_DIR/canary_summary.json" <<'PY' || fail "canary safety gate rejected this configuration"
+import json
+import sys
+summary = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if summary.get("canary_gate_passed") is True else 1)
+PY
   echo "[canary complete] summary=$CANARY_DIR/canary_summary.json"
   exit 0
 fi
@@ -286,7 +376,7 @@ fi
 LATEST="$RUN_DIR/jepa-latest.pth.tar"
 
 checkpoint_status() {
-  python - "$LATEST" "$OWNER" "$EXPECTED_COMMIT" "$SOURCE_SHA" "$SIDECAR_SHA" "$DATA_AUDIT" "$NO_FILE_SCAN" "$PI_LTC_CONTENT_HASH_MODE" "$OPTIMIZER_STEP_BUDGET" "$LEWM_REFERENCE_PASSES" "$DRIVER_EPOCHS" <<'PY'
+  python - "$LATEST" "$OWNER" "$EXPECTED_COMMIT" "$SOURCE_SHA" "$SIDECAR_SHA" "$DATA_AUDIT" "$NO_FILE_SCAN" "$PI_LTC_CONTENT_HASH_MODE" "$OPTIMIZER_STEP_BUDGET" "$LEWM_REFERENCE_PASSES" "$DRIVER_EPOCHS" "$TARGET_COMPLETE_PASSES" <<'PY'
 import json, sys
 from pathlib import Path
 import torch
@@ -302,10 +392,12 @@ import torch
     budget_text,
     reference_passes_text,
     driver_epochs_text,
+    target_passes_text,
 ) = sys.argv[1:]
 budget = int(budget_text)
 reference_passes = int(reference_passes_text)
 driver_epochs = int(driver_epochs_text)
+target_passes = int(target_passes_text)
 path = Path(path)
 if not path.is_file():
     raise SystemExit(1)
@@ -357,7 +449,18 @@ if checkpoint.get("training_complete") is True:
     )
     raise SystemExit(0)
 if (
-    0 <= epoch < driver_epochs
+    target_passes <= epoch <= expected_full_passes
+    and step_in_epoch == 0
+    and total_steps == epoch * steps
+    and total_steps < budget
+):
+    print(
+        f"[requested pass boundary complete] requested={target_passes} "
+        f"completed_passes={epoch} steps/pass={steps} total_steps={total_steps}"
+    )
+    raise SystemExit(0)
+if (
+    0 <= epoch < target_passes
     and step_in_epoch == 0
     and total_steps == epoch * steps
     and total_steps < budget
@@ -383,9 +486,10 @@ esac
 
 mkdir -p "$RUN_DIR/logs"
 LOG="$RUN_DIR/logs/${TASK}_${ARM}_$(date +%Y%m%d_%H%M%S).log"
-echo "[launch] task=$TASK arm=$ARM commit=$EXPECTED_COMMIT config=$CONFIG log=$LOG"
+echo "[launch] task=$TASK arm=$ARM target_complete_passes=$TARGET_COMPLETE_PASSES commit=$EXPECTED_COMMIT config=$CONFIG log=$LOG"
 set +e
-python -m app.main --fname "$CONFIG" --devices cuda:0 --debug 2>&1 | tee "$LOG"
+PI_LTC_STOP_AFTER_COMPLETE_PASSES="$TARGET_COMPLETE_PASSES" \
+  python -m app.main --fname "$CONFIG" --devices cuda:0 --debug 2>&1 | tee "$LOG"
 TRAIN_RC=${PIPESTATUS[0]}
 set -e
 test "$TRAIN_RC" -eq 0 || fail "training returned status=$TRAIN_RC"
@@ -395,4 +499,4 @@ checkpoint_status
 CHECKPOINT_RC=$?
 set -e
 test "$CHECKPOINT_RC" -eq 0 || fail "training returned without a complete strict checkpoint"
-echo "[training complete] task=$TASK arm=$ARM checkpoint=$LATEST"
+echo "[training target complete] task=$TASK arm=$ARM complete_passes=$TARGET_COMPLETE_PASSES checkpoint=$LATEST"

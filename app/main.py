@@ -74,8 +74,16 @@ def process_main(rank, fname, world_size, devices):
     world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
     logger.info(f"Running... (rank: {rank}/{world_size})")
 
-    # Launch the app with loaded config
-    app_main(params["app"], args=params)
+    # Launch the app with loaded config.  Boundary-limited and canary runs are
+    # normal successful exits, so explicitly tear down NCCL instead of leaving
+    # PyTorch to warn about a leaked process group at interpreter shutdown.
+    try:
+        app_main(params["app"], args=params)
+    finally:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

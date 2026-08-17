@@ -30,6 +30,7 @@ import matplotlib
 import numpy as np
 import submitit
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 import wandb
 from einops import rearrange
@@ -152,6 +153,13 @@ def main(args, resume_preempt=False):
     canary_optimizer_steps = int(cfgs_meta.get("canary_optimizer_steps", 0) or 0)
     if canary_optimizer_steps < 0:
         raise ValueError("meta.canary_optimizer_steps must be non-negative")
+    stop_after_complete_passes = int(
+        os.environ.get("PI_LTC_STOP_AFTER_COMPLETE_PASSES", "0") or 0
+    )
+    if stop_after_complete_passes < 0:
+        raise ValueError(
+            "PI_LTC_STOP_AFTER_COMPLETE_PASSES must be non-negative"
+        )
     which_dtype = cfgs_meta.get("dtype")
     logger.info(f"⚙️  Using dtype: {which_dtype}")
     if which_dtype.lower() == "bfloat16":
@@ -570,6 +578,17 @@ def main(args, resume_preempt=False):
             f"epochs={num_epochs}, steps_per_epoch={optimizer_steps_per_epoch}, "
             f"budget={optimizer_step_budget}"
         )
+    maximum_complete_passes = optimizer_step_budget // optimizer_steps_per_epoch
+    if (
+        stop_after_complete_passes > 0
+        and stop_after_complete_passes > maximum_complete_passes
+    ):
+        raise ValueError(
+            "requested pass-boundary stop exceeds the configured optimizer "
+            "horizon: "
+            f"requested={stop_after_complete_passes}, "
+            f"maximum_complete_passes={maximum_complete_passes}"
+        )
     training_microbatch_budget = optimizer_step_budget * gradient_accumulation_steps
     logger.info(
         "Training schedule: "
@@ -603,6 +622,8 @@ def main(args, resume_preempt=False):
     planner_loader = None
     planner_sampler = None
     planner_validation_groups = None
+    planner_validation_loader = None
+    planner_validation_sampler = None
     if planner_identified_enabled:
         if dataset_type != "stablewm_h5":
             raise ValueError("planner-identified cross-model training requires dataset_type=stablewm_h5")
@@ -611,6 +632,16 @@ def main(args, resume_preempt=False):
         sidecar_h5 = cfgs_planner_identified.get("sidecar_h5")
         if not sidecar_h5:
             raise ValueError("planner_identified.sidecar_h5 is required")
+        planner_history_size = int(
+            cfgs_planner_identified.get(
+                "history_size",
+                cfgs_custom.get("num_hist", 1),
+            )
+        )
+        if planner_history_size != int(cfgs_custom.get("num_hist", 1)):
+            raise ValueError(
+                "planner history_size must equal data.custom.num_hist"
+            )
         planner_dataset = PlannerLandscapeH5Dataset(
             source_h5=dataset_paths[0],
             sidecar_h5=sidecar_h5,
@@ -629,6 +660,8 @@ def main(args, resume_preempt=False):
                 "expected_config_sha256"
             ),
             frameskip=frameskip,
+            action_skip=action_skip,
+            history_size=planner_history_size,
             goal_offset_steps=cfgs_planner_identified.get("goal_offset_steps", 25),
         )
         planner_training_groups, planner_validation_groups = split_planner_groups_by_physical_episode(
@@ -659,11 +692,41 @@ def main(args, resume_preempt=False):
         planner_loader = DataLoader(**planner_loader_kwargs)
         if len(planner_loader) < 1:
             raise ValueError("planner landscape loader has no complete group batch")
+        planner_validation_sampler = DistributedSampler(
+            planner_validation_groups,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        if len(planner_validation_groups) % world_size:
+            raise ValueError(
+                "planner held-out groups must divide world_size exactly so "
+                "checkpoint selection never duplicates validation groups"
+            )
+        planner_validation_loader_kwargs = dict(planner_loader_kwargs)
+        planner_validation_loader_kwargs.update(
+            {
+                "dataset": planner_validation_groups,
+                "batch_size": int(
+                    cfgs_planner_identified.get(
+                        "validation_groups_per_batch",
+                        cfgs_planner_identified.get("groups_per_batch", 16),
+                    )
+                ),
+                "sampler": planner_validation_sampler,
+                "drop_last": False,
+            }
+        )
+        planner_validation_loader = DataLoader(**planner_validation_loader_kwargs)
+        if len(planner_validation_loader) < 1:
+            raise ValueError("planner held-out loader has no group batch")
         logger.info(
             "Planner landscape split: "
             f"train_groups={len(planner_training_groups)}, "
             f"validation_groups={len(planner_validation_groups)}, "
-            f"group_batches={len(planner_loader)}"
+            f"train_batches={len(planner_loader)}, "
+            f"validation_batches={len(planner_validation_loader)}"
         )
 
     # Logger
@@ -676,7 +739,12 @@ def main(args, resume_preempt=False):
             "planner_scale",
             "planner_valid_group_fraction",
             "planner_valid_pairwise_sign_accuracy",
+            "planner_predicted_to_real_cost_std_ratio",
+            "info/planner_scale/lr",
             "optim/planner_scale/grad_norm_before_clip",
+            "validation/planner_landscape_loss",
+            "validation/planner_valid_pairwise_sign_accuracy",
+            "validation/planner_predicted_to_real_cost_std_ratio",
         )
 
         def __init__(self, config):
@@ -707,8 +775,39 @@ def main(args, resume_preempt=False):
                 # Retain every scalar for audit/export while preventing W&B's
                 # automatic workspace from creating dozens of low-value panels.
                 wandb.define_metric("*", hidden=True)
+                wandb.define_metric("total_optimizer_step", hidden=True)
+                wandb.define_metric(
+                    "validation/total_optimizer_steps",
+                    hidden=True,
+                )
+                planner_step_metrics = {
+                    "planner_landscape_loss",
+                    "planner_log_scale",
+                    "planner_scale",
+                    "planner_valid_group_fraction",
+                    "planner_valid_pairwise_sign_accuracy",
+                    "planner_predicted_to_real_cost_std_ratio",
+                    "info/planner_scale/lr",
+                    "optim/planner_scale/grad_norm_before_clip",
+                }
                 for metric_name in self._visible_wandb_metrics:
-                    wandb.define_metric(metric_name, hidden=False)
+                    step_metric = (
+                        "validation/total_optimizer_steps"
+                        if metric_name.startswith("validation/")
+                        else (
+                            "total_optimizer_step"
+                            if metric_name in planner_step_metrics
+                            else None
+                        )
+                    )
+                    if step_metric is None:
+                        wandb.define_metric(metric_name, hidden=False)
+                    else:
+                        wandb.define_metric(
+                            metric_name,
+                            step_metric=step_metric,
+                            hidden=False,
+                        )
                 self.job_set = set()
 
         def log(self, epoch, itr, losses, total_stats, eval_losses=None, eval_total_stats=None, image_stats=None):
@@ -880,6 +979,16 @@ def main(args, resume_preempt=False):
             proprio_encoder=proprio_encoder,
             encoder=encoder,
             freeze_encoder=freeze_encoder,
+            planner_scale_lr_multiplier=(
+                float(
+                    cfgs_planner_identified.get(
+                        "scale_lr_multiplier",
+                        1.0,
+                    )
+                )
+                if planner_identified_enabled
+                else None
+            ),
             **cfgs_opt["transition_model"],
         )
         clip_grad = cfgs_opt["transition_model"]["clip_grad"]
@@ -1055,6 +1164,12 @@ def main(args, resume_preempt=False):
             "planner_valid_pairwise_sign_accuracy": zero,
             "planner_predicted_cost_std": zero,
             "planner_real_cost_std": zero,
+            "planner_predicted_to_real_cost_std_ratio": zero,
+            "planner_zero_difference_baseline": zero.new_tensor(1.0),
+            "planner_improvement_over_zero_difference": zero,
+            "planner_context_frames": zero.new_tensor(
+                float(cfgs_custom.get("num_hist", 1))
+            ),
             "planner_valid_group_count": zero,
             "planner_valid_group_fraction": zero,
             "planner_target_energy_min": zero,
@@ -1081,6 +1196,8 @@ def main(args, resume_preempt=False):
         total_optimizer_step_count=None,
         optimizer_step_in_epoch=0,
         training_complete=False,
+        planner_validation_metrics=None,
+        planner_selection=None,
     ):
         if rank != 0:
             return
@@ -1098,6 +1215,11 @@ def main(args, resume_preempt=False):
             "optimizer_step_in_epoch": int(optimizer_step_in_epoch),
             "optimizer_step_budget": optimizer_step_budget,
             "training_complete": bool(training_complete),
+            "requested_stop_after_complete_passes": (
+                stop_after_complete_passes
+            ),
+            "planner_validation_metrics": planner_validation_metrics,
+            "planner_selection": planner_selection,
             "training_provenance": training_provenance,
             "common_trainable_initialization_sha256": (
                 common_trainable_initialization_sha256
@@ -1193,6 +1315,205 @@ def main(args, resume_preempt=False):
             planner_loader_iter = iter(planner_loader)
             return next(planner_loader_iter)
 
+    planner_validation_history_path = Path(folder) / "planner_validation_history.json"
+    planner_best_checkpoint_path = os.path.join(
+        checkpoint_folder,
+        pref_tag + f"planner-best.{latest_format}",
+    )
+    planner_validation_document = {
+        "schema_version": 1,
+        "selection_criterion": (
+            "minimum held-out normalized pairwise landscape loss at a complete "
+            "physical data-pass boundary, restricted to loss<1 (better than the "
+            "zero-difference response) and valid sign accuracy>0.5; sign "
+            "accuracy breaks exact ties"
+        ),
+        "records": [],
+        "best": None,
+    }
+    if rank == 0 and planner_identified_enabled and planner_validation_history_path.exists():
+        loaded_validation_document = json.loads(
+            planner_validation_history_path.read_text(encoding="utf-8")
+        )
+        if loaded_validation_document.get("schema_version") != 1:
+            raise ValueError("unsupported planner validation history schema")
+        planner_validation_document = loaded_validation_document
+
+    def evaluate_planner_validation():
+        if planner_validation_loader is None:
+            raise RuntimeError("planner validation requested while PI-LTC is disabled")
+        # loss*valid, sign*valid, predicted_std*groups, real_std*groups,
+        # valid groups, all groups
+        totals = torch.zeros(6, dtype=torch.float64, device=device)
+        for validation_batch in planner_validation_loader:
+            validation_result = planner_landscape_result(
+                world_model,
+                validation_batch,
+                device=device,
+                dtype=dtype,
+                mixed_precision=mixed_precision,
+                target_energy_eps=float(
+                    cfgs_planner_identified.get("target_energy_eps", 1.0e-8)
+                ),
+                target_energy_relative_floor=float(
+                    cfgs_planner_identified.get(
+                        "target_energy_relative_floor",
+                        0.0,
+                    )
+                ),
+                compute_scale_gradient=False,
+            )
+            validation_stats = validation_result.stats
+            group_count = int(validation_batch["next_visual"].shape[0])
+            valid_count = float(validation_stats["planner_valid_group_count"])
+            totals[0] += float(validation_result.loss) * valid_count
+            totals[1] += (
+                float(validation_stats["planner_valid_pairwise_sign_accuracy"])
+                * valid_count
+            )
+            totals[2] += float(validation_stats["planner_predicted_cost_std"]) * group_count
+            totals[3] += float(validation_stats["planner_real_cost_std"]) * group_count
+            totals[4] += valid_count
+            totals[5] += group_count
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        valid_count = float(totals[4].item())
+        group_count = float(totals[5].item())
+        if valid_count <= 0.0 or group_count != float(len(planner_validation_groups)):
+            raise RuntimeError(
+                "planner held-out evaluation has no identifiable groups or did not "
+                "cover every held-out group exactly once"
+            )
+        predicted_std = float(totals[2].item() / group_count)
+        real_std = float(totals[3].item() / group_count)
+        validation_loss = float(totals[0].item() / valid_count)
+        metrics = {
+            "planner_landscape_loss": validation_loss,
+            "planner_valid_pairwise_sign_accuracy": float(
+                totals[1].item() / valid_count
+            ),
+            "planner_predicted_cost_std": predicted_std,
+            "planner_real_cost_std": real_std,
+            "planner_predicted_to_real_cost_std_ratio": predicted_std
+            / max(real_std, float(cfgs_planner_identified.get("target_energy_eps", 1.0e-8)) ** 0.5),
+            "planner_valid_group_count": int(valid_count),
+            "planner_group_count": int(group_count),
+            "planner_valid_group_fraction": valid_count / group_count,
+            "planner_zero_difference_baseline": 1.0,
+            "planner_improvement_over_zero_difference": 1.0 - validation_loss,
+            "planner_scale": float(
+                planner_input_scale(world_model).input_scale.detach().cpu()
+            ),
+            "planner_log_scale": float(
+                planner_input_scale(world_model).log_scale.detach().cpu()
+            ),
+            "planner_context_frames": int(cfgs_custom.get("num_hist", 1)),
+        }
+        if not all(np.isfinite(value) for value in metrics.values()):
+            raise RuntimeError("planner held-out evaluation produced a non-finite metric")
+        return metrics
+
+    def persist_planner_validation(
+        metrics,
+        *,
+        boundary,
+        total_optimizer_steps,
+        checkpoint_epoch,
+        optimizer_step_in_epoch,
+        eligible_for_selection,
+        training_complete,
+    ):
+        if rank != 0:
+            return False
+        beats_zero_difference = metrics["planner_landscape_loss"] < 1.0
+        beats_chance_ordering = (
+            metrics["planner_valid_pairwise_sign_accuracy"] > 0.5
+        )
+        scientifically_eligible = (
+            bool(eligible_for_selection)
+            and beats_zero_difference
+            and beats_chance_ordering
+        )
+        record = {
+            "boundary": str(boundary),
+            "total_optimizer_steps": int(total_optimizer_steps),
+            "completed_physical_passes": int(total_optimizer_steps)
+            // optimizer_steps_per_epoch,
+            "optimizer_step_in_pass": int(optimizer_step_in_epoch),
+            "complete_pass_boundary": bool(eligible_for_selection),
+            "beats_zero_difference_baseline": beats_zero_difference,
+            "beats_chance_pairwise_ordering": beats_chance_ordering,
+            "eligible_for_selection": scientifically_eligible,
+            "metrics": dict(metrics),
+            "checkpoint": None,
+        }
+        best = planner_validation_document.get("best")
+        is_best = False
+        if scientifically_eligible:
+            if best is None:
+                is_best = True
+            else:
+                candidate_loss = metrics["planner_landscape_loss"]
+                best_loss = best["metrics"]["planner_landscape_loss"]
+                candidate_sign = metrics[
+                    "planner_valid_pairwise_sign_accuracy"
+                ]
+                best_sign = best["metrics"][
+                    "planner_valid_pairwise_sign_accuracy"
+                ]
+                is_best = candidate_loss < best_loss or (
+                    candidate_loss == best_loss and candidate_sign > best_sign
+                )
+        if is_best:
+            selection = {
+                "criterion": planner_validation_document["selection_criterion"],
+                "total_optimizer_steps": int(total_optimizer_steps),
+                "completed_physical_passes": int(total_optimizer_steps)
+                // optimizer_steps_per_epoch,
+            }
+            save_checkpoint(
+                checkpoint_epoch,
+                planner_best_checkpoint_path,
+                total_optimizer_step_count=total_optimizer_steps,
+                optimizer_step_in_epoch=optimizer_step_in_epoch,
+                training_complete=training_complete,
+                planner_validation_metrics=dict(metrics),
+                planner_selection=selection,
+            )
+            record["checkpoint"] = planner_best_checkpoint_path
+            planner_validation_document["best"] = record
+        planner_validation_document["records"].append(record)
+        temporary_path = planner_validation_history_path.with_suffix(".json.tmp")
+        temporary_path.write_text(
+            json.dumps(planner_validation_document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(planner_validation_history_path)
+        if trainer.use_wandb:
+            wandb.log(
+                {
+                    "validation/planner_landscape_loss": metrics[
+                        "planner_landscape_loss"
+                    ],
+                    "validation/planner_valid_pairwise_sign_accuracy": metrics[
+                        "planner_valid_pairwise_sign_accuracy"
+                    ],
+                    "validation/planner_predicted_to_real_cost_std_ratio": metrics[
+                        "planner_predicted_to_real_cost_std_ratio"
+                    ],
+                    "validation/planner_scale": metrics["planner_scale"],
+                    "validation/total_optimizer_steps": int(total_optimizer_steps),
+                }
+            )
+        logger.info(
+            "[PLANNER HELD-OUT] "
+            f"boundary={boundary} steps={total_optimizer_steps} "
+            f"loss={metrics['planner_landscape_loss']:.6f} "
+            f"sign={metrics['planner_valid_pairwise_sign_accuracy']:.4f} "
+            f"scale={metrics['planner_scale']:.6f} best={is_best}"
+        )
+        return is_best
+
     def get_viz_batch():
         """Get a visualization batch from the non-distributed validation loader (rank 0 only)"""
         nonlocal viz_val_loader_iter
@@ -1228,12 +1549,34 @@ def main(args, resume_preempt=False):
     if not (plan_only_eval_mode or unroll_decode_eval_only_mode):
         canary_complete = False
         step_budget_complete = False
+        planner_initial_validation_metrics = None
+        if (
+            planner_identified_enabled
+            and not light_eval_only_mode
+            and start_epoch == 0
+            and bool(cfgs_planner_identified.get("validation_at_start", True))
+        ):
+            planner_initial_validation_metrics = evaluate_planner_validation()
+            persist_planner_validation(
+                planner_initial_validation_metrics,
+                boundary="initialization",
+                total_optimizer_steps=0,
+                checkpoint_epoch=0,
+                optimizer_step_in_epoch=0,
+                eligible_for_selection=False,
+                training_complete=False,
+            )
+        if canary_optimizer_steps and planner_initial_validation_metrics is None:
+            raise ValueError(
+                "PI canary requires planner_identified.validation_at_start=true"
+            )
         canary_valid_fraction_meter = AverageMeter()
         canary_landscape_loss_meter = AverageMeter()
         canary_sign_accuracy_meter = AverageMeter()
         canary_scale_gradient_abs_meter = AverageMeter()
         canary_effective_energy_floor_meter = AverageMeter()
         canary_min_to_median_energy_ratio_meter = AverageMeter()
+        boundary_stop_complete = False
         for epoch in range(start_epoch, num_epochs):
             logger.info("\n" + "─" * 50)
             logger.info(f"📈 Epoch {epoch + 1}/{num_epochs}")
@@ -1277,6 +1620,19 @@ def main(args, resume_preempt=False):
                         elif train_predictor:
                             rates["info/transition_model/lr"] = optimizer.param_groups[0]["lr"]
                             rates["info/transition_model/wd"] = optimizer.param_groups[0]["weight_decay"]
+                        if planner_identified_enabled:
+                            planner_scale_groups = [
+                                group
+                                for group in optimizer.param_groups
+                                if group.get("group_name") == "planner_scale"
+                            ]
+                            if len(planner_scale_groups) != 1:
+                                raise RuntimeError(
+                                    "planner scale optimizer group is missing or duplicated"
+                                )
+                            rates["info/planner_scale/lr"] = planner_scale_groups[0][
+                                "lr"
+                            ]
                         if train_heads:
                             for name, head in world_model.heads.items():
                                 rates[f"info/{name}/lr"] = head.scheduler.step()
@@ -1964,11 +2320,109 @@ def main(args, resume_preempt=False):
                     break
             logger.info("avg. loss %.3f" % loss_meter.avg)
 
+            planner_validation_metrics = None
+            planner_validation_total_steps = None
+            planner_validation_step_in_pass = 0
+            planner_validation_boundary = None
+            if planner_identified_enabled and not light_eval_only_mode:
+                if canary_complete:
+                    planner_validation_total_steps = int(canary_optimizer_steps)
+                    planner_validation_step_in_pass = int(canary_optimizer_steps)
+                    planner_validation_boundary = "canary"
+                elif step_budget_complete:
+                    planner_validation_total_steps = int(optimizer_step_budget)
+                    planner_validation_step_in_pass = (
+                        planner_validation_total_steps % optimizer_steps_per_epoch
+                    )
+                    planner_validation_boundary = (
+                        "pass"
+                        if planner_validation_step_in_pass == 0
+                        else "final_partial_pass"
+                    )
+                elif itr + 1 == ipe:
+                    planner_validation_total_steps = (
+                        epoch + 1
+                    ) * optimizer_steps_per_epoch
+                    planner_validation_boundary = "pass"
+                if planner_validation_total_steps is not None:
+                    planner_validation_metrics = evaluate_planner_validation()
+                    completed_passes = (
+                        planner_validation_total_steps // optimizer_steps_per_epoch
+                    )
+                    persist_planner_validation(
+                        planner_validation_metrics,
+                        boundary=planner_validation_boundary,
+                        total_optimizer_steps=planner_validation_total_steps,
+                        checkpoint_epoch=completed_passes,
+                        optimizer_step_in_epoch=planner_validation_step_in_pass,
+                        eligible_for_selection=(
+                            planner_validation_boundary == "pass"
+                            and planner_validation_total_steps > 0
+                        ),
+                        training_complete=(
+                            step_budget_complete
+                            or (
+                                not exact_optimizer_step_budget
+                                and epoch == num_epochs - 1
+                                and planner_validation_boundary == "pass"
+                            )
+                        ),
+                    )
+
+            boundary_stop_complete = (
+                stop_after_complete_passes > 0
+                and not canary_complete
+                and not step_budget_complete
+                and itr + 1 == ipe
+                and epoch + 1 >= stop_after_complete_passes
+            )
+
             if canary_complete:
                 if rank == 0:
                     scale = planner_input_scale(world_model)
+                    log_scale_drift_per_1000_steps = (
+                        (
+                            planner_validation_metrics["planner_log_scale"]
+                            - planner_initial_validation_metrics["planner_log_scale"]
+                        )
+                        * 1000.0
+                        / canary_optimizer_steps
+                    )
+                    max_canary_drift = cfgs_planner_identified.get(
+                        "canary_max_abs_log_scale_drift_per_1000_steps"
+                    )
+                    canary_drift_passed = (
+                        max_canary_drift is None
+                        or abs(log_scale_drift_per_1000_steps)
+                        <= float(max_canary_drift)
+                    )
+                    require_non_degradation = bool(
+                        cfgs_planner_identified.get(
+                            "canary_require_heldout_non_degradation",
+                            False,
+                        )
+                    )
+                    canary_validation_passed = (
+                        not require_non_degradation
+                        or planner_validation_metrics["planner_landscape_loss"]
+                        <= planner_initial_validation_metrics[
+                            "planner_landscape_loss"
+                        ]
+                    )
+                    canary_gate_passed = (
+                        canary_drift_passed and canary_validation_passed
+                    )
                     summary = {
-                        "status": "CANARY_COMPLETE",
+                        "status": (
+                            "CANARY_COMPLETE"
+                            if canary_gate_passed
+                            else "CANARY_REJECTED"
+                        ),
+                        "canary_gate_passed": canary_gate_passed,
+                        "canary_log_scale_drift_passed": canary_drift_passed,
+                        "canary_heldout_non_degradation_passed": (
+                            canary_validation_passed
+                        ),
                         "optimizer_steps": canary_optimizer_steps,
                         "microbatches": (
                             canary_optimizer_steps * gradient_accumulation_steps
@@ -1976,6 +2430,15 @@ def main(args, resume_preempt=False):
                         "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
                         "microbatches_per_epoch": ipe,
                         "gradient_accumulation_steps": gradient_accumulation_steps,
+                        "planner_history_size": int(
+                            cfgs_custom.get("num_hist", 1)
+                        ),
+                        "planner_scale_lr_multiplier": float(
+                            cfgs_planner_identified.get(
+                                "scale_lr_multiplier",
+                                1.0,
+                            )
+                        ),
                         "target_energy_eps": float(
                             cfgs_planner_identified.get(
                                 "target_energy_eps",
@@ -1990,6 +2453,19 @@ def main(args, resume_preempt=False):
                         ),
                         "final_log_scale": float(scale.log_scale.detach().cpu()),
                         "final_scale": float(scale.input_scale.detach().cpu()),
+                        "heldout_initial": planner_initial_validation_metrics,
+                        "heldout_final": planner_validation_metrics,
+                        "log_scale_drift_per_1000_optimizer_steps": (
+                            log_scale_drift_per_1000_steps
+                        ),
+                        "canary_max_abs_log_scale_drift_per_1000_steps": (
+                            None
+                            if max_canary_drift is None
+                            else float(max_canary_drift)
+                        ),
+                        "canary_require_heldout_non_degradation": (
+                            require_non_degradation
+                        ),
                         "valid_group_fraction": {
                             "mean": canary_valid_fraction_meter.avg,
                             "min": canary_valid_fraction_meter.min,
@@ -2030,7 +2506,9 @@ def main(args, resume_preempt=False):
                         encoding="utf-8",
                     )
                     temporary_path.replace(summary_path)
-                    logger.info(f"[CANARY COMPLETE] summary={summary_path}")
+                    logger.info(
+                        f"[{summary['status']}] summary={summary_path}"
+                    )
                 break
 
             if step_budget_complete:
@@ -2045,6 +2523,7 @@ def main(args, resume_preempt=False):
                         total_optimizer_step_count=optimizer_step_budget,
                         optimizer_step_in_epoch=optimizer_step_in_partial_pass,
                         training_complete=True,
+                        planner_validation_metrics=planner_validation_metrics,
                     )
                     step_file = pref_tag + f"step{optimizer_step_budget}.{latest_format}"
                     step_path = os.path.join(checkpoint_folder, step_file)
@@ -2054,7 +2533,25 @@ def main(args, resume_preempt=False):
                         total_optimizer_step_count=optimizer_step_budget,
                         optimizer_step_in_epoch=optimizer_step_in_partial_pass,
                         training_complete=True,
+                        planner_validation_metrics=planner_validation_metrics,
                     )
+                    if (
+                        optimizer_step_in_partial_pass == 0
+                        and completed_full_passes > 0
+                        and save_every_freq > 0
+                    ):
+                        pass_file = pref_tag + (
+                            f"e{completed_full_passes - 1}.{latest_format}"
+                        )
+                        pass_path = os.path.join(checkpoint_folder, pass_file)
+                        save_checkpoint(
+                            completed_full_passes,
+                            pass_path,
+                            total_optimizer_step_count=optimizer_step_budget,
+                            optimizer_step_in_epoch=0,
+                            training_complete=True,
+                            planner_validation_metrics=planner_validation_metrics,
+                        )
                     scale = (
                         planner_input_scale(world_model)
                         if planner_identified_enabled
@@ -2079,6 +2576,15 @@ def main(args, resume_preempt=False):
                         "final_scale": (
                             float(scale.input_scale.detach().cpu())
                             if scale is not None
+                            else None
+                        ),
+                        "planner_heldout_final": planner_validation_metrics,
+                        "planner_best_checkpoint": (
+                            planner_validation_document.get("best", {}).get(
+                                "checkpoint"
+                            )
+                            if planner_identified_enabled
+                            and planner_validation_document.get("best")
                             else None
                         ),
                         "repository_commit": (
@@ -2112,6 +2618,7 @@ def main(args, resume_preempt=False):
                                 not exact_optimizer_step_budget
                                 and epoch == num_epochs - 1
                             ),
+                            planner_validation_metrics=planner_validation_metrics,
                         )
                         if save_every_freq > 0 and epoch % save_every_freq == 0:
                             save_every_file = pref_tag + f"e{epoch}.{latest_format}"
@@ -2123,7 +2630,73 @@ def main(args, resume_preempt=False):
                                     not exact_optimizer_step_budget
                                     and epoch == num_epochs - 1
                                 ),
+                                planner_validation_metrics=planner_validation_metrics,
                             )
+
+            if boundary_stop_complete:
+                if rank == 0:
+                    scale = (
+                        planner_input_scale(world_model)
+                        if planner_identified_enabled
+                        else None
+                    )
+                    summary = {
+                        "status": "PASS_BOUNDARY_COMPLETE",
+                        "requested_complete_passes": (
+                            stop_after_complete_passes
+                        ),
+                        "completed_full_passes": epoch + 1,
+                        "optimizer_steps": (
+                            (epoch + 1) * optimizer_steps_per_epoch
+                        ),
+                        "optimizer_steps_per_pass": (
+                            optimizer_steps_per_epoch
+                        ),
+                        "configured_optimizer_step_budget": (
+                            optimizer_step_budget
+                        ),
+                        "gradient_accumulation_steps": (
+                            gradient_accumulation_steps
+                        ),
+                        "final_log_scale": (
+                            float(scale.log_scale.detach().cpu())
+                            if scale is not None
+                            else None
+                        ),
+                        "final_scale": (
+                            float(scale.input_scale.detach().cpu())
+                            if scale is not None
+                            else None
+                        ),
+                        "planner_heldout_at_boundary": (
+                            planner_validation_metrics
+                        ),
+                        "planner_best_checkpoint": (
+                            planner_validation_document.get("best", {}).get(
+                                "checkpoint"
+                            )
+                            if planner_identified_enabled
+                            and planner_validation_document.get("best")
+                            else None
+                        ),
+                        "repository_commit": (
+                            training_provenance.get("repository_commit")
+                            if training_provenance is not None
+                            else None
+                        ),
+                    }
+                    summary_path = Path(folder) / "pass_boundary_summary.json"
+                    temporary_path = summary_path.with_suffix(".json.tmp")
+                    temporary_path.write_text(
+                        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    temporary_path.replace(summary_path)
+                    logger.info(
+                        "[PASS BOUNDARY COMPLETE] "
+                        f"passes={epoch + 1} summary={summary_path}"
+                    )
+                break
 
             # -- Launch Planning Eval
             if not light_eval_only_mode and not skip_planning_eval:

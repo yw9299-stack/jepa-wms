@@ -6,6 +6,7 @@
 #
 
 import logging
+import math
 import sys
 
 import torch
@@ -934,6 +935,7 @@ def init_opt(
     eps=1e-8,
     use_wsd_schedule=False,
     anneal_steps=None,
+    planner_scale_lr_multiplier=None,
     **kwargs,
 ):
     """
@@ -945,88 +947,73 @@ def init_opt(
                       warmup_steps to be backwards compatible (approximately similar behavior).
                       Only used when use_wsd_schedule=True.
     """
-    param_groups = []
-    param_groups += [
-        {
-            "params": (
-                p
-                for n, p in predictor.named_parameters()
-                if ("bias" not in n) and (len(p.shape) != 1) and p.requires_grad
+    planner_scale_parameter = None
+    planner_scale_ids = set()
+    if planner_scale_lr_multiplier is not None:
+        planner_scale_lr_multiplier = float(planner_scale_lr_multiplier)
+        if (
+            not math.isfinite(planner_scale_lr_multiplier)
+            or planner_scale_lr_multiplier <= 0.0
+        ):
+            raise ValueError("planner_scale_lr_multiplier must be finite and positive")
+        matches = [
+            parameter
+            for name, parameter in predictor.named_parameters()
+            if name.endswith("planner_input_scale.log_scale")
+            and parameter.requires_grad
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "planner scale LR isolation requires exactly one trainable "
+                f"planner_input_scale.log_scale parameter, found {len(matches)}"
             )
-        },
-    ]
-    param_groups += [
-        {
-            "params": (
-                p for n, p in predictor.named_parameters() if ("bias" in n) or (len(p.shape) == 1) and p.requires_grad
-            ),
-            "WD_exclude": True,
-            "weight_decay": 0,
-        },
-    ]
-    if action_encoder is not None:
-        param_groups += [
-            {
-                "params": (
-                    p
-                    for n, p in action_encoder.named_parameters()
-                    if ("bias" not in n) and (len(p.shape) != 1) and p.requires_grad
-                )
-            }
-        ]
-        param_groups += [
-            {
-                "params": (
-                    p
-                    for n, p in action_encoder.named_parameters()
-                    if ("bias" in n) or (len(p.shape) == 1) and p.requires_grad
-                ),
-                "WD_exclude": True,
-                "weight_decay": 0,
-            },
-        ]
-    if proprio_encoder is not None:
-        param_groups += [
-            {
-                "params": (
-                    p
-                    for n, p in proprio_encoder.named_parameters()
-                    if ("bias" not in n) and (len(p.shape) != 1) and p.requires_grad
-                )
-            }
-        ]
-        param_groups += [
-            {
-                "params": (
-                    p
-                    for n, p in proprio_encoder.named_parameters()
-                    if ("bias" in n) or (len(p.shape) == 1) and p.requires_grad
-                ),
-                "WD_exclude": True,
-                "weight_decay": 0,
-            },
-        ]
+        planner_scale_parameter = matches[0]
+        planner_scale_ids.add(id(planner_scale_parameter))
+
+    param_groups = []
+
+    def add_module_parameter_groups(module):
+        if module is None:
+            return
+        decay = []
+        no_decay = []
+        for name, parameter in module.named_parameters():
+            if not parameter.requires_grad or id(parameter) in planner_scale_ids:
+                continue
+            if "bias" in name or len(parameter.shape) == 1:
+                no_decay.append(parameter)
+            else:
+                decay.append(parameter)
+        if decay:
+            param_groups.append({"params": decay})
+        if no_decay:
+            param_groups.append(
+                {
+                    "params": no_decay,
+                    "WD_exclude": True,
+                    "weight_decay": 0,
+                }
+            )
+
+    add_module_parameter_groups(predictor)
+    add_module_parameter_groups(action_encoder)
+    add_module_parameter_groups(proprio_encoder)
     if encoder is not None and not freeze_encoder:
-        param_groups += [
+        add_module_parameter_groups(encoder)
+    if planner_scale_parameter is not None:
+        param_groups.append(
             {
-                "params": (
-                    p
-                    for n, p in encoder.named_parameters()
-                    if ("bias" not in n) and (len(p.shape) != 1) and p.requires_grad
-                )
-            }
-        ]
-        param_groups += [
-            {
-                "params": (
-                    p
-                    for n, p in encoder.named_parameters()
-                    if ("bias" in n) or (len(p.shape) == 1) and p.requires_grad
-                ),
+                "params": [planner_scale_parameter],
                 "WD_exclude": True,
                 "weight_decay": 0,
-            },
-        ]
+                "lr_scale": planner_scale_lr_multiplier,
+                "group_name": "planner_scale",
+            }
+        )
+        logger.info(
+            "Planner input scale optimizer isolation: "
+            f"lr_multiplier={planner_scale_lr_multiplier:g}, weight_decay=0"
+        )
 
     if use_radamw:
         logger.info("Using Rescaled-AdamW")

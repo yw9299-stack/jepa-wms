@@ -17,11 +17,112 @@ from app.vjepa_wm.planner_landscape import (
     install_planner_scale_gradient,
     normalized_pairwise_landscape_error,
     pairwise_sign_accuracy,
+    planner_landscape_result,
 )
+from app.vjepa_wm.utils import init_opt
 from src.utils.schedulers import resolve_optimizer_schedule_steps
 
 
 class TestPlannerLandscapeLoss(unittest.TestCase):
+    def test_planner_forward_uses_full_history_and_only_final_endpoint_cost(self):
+        class Predictor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.planner_input_scale = PlannerIdentifiedInputScale()
+
+        class WorldModel:
+            def __init__(self):
+                self.encoder = torch.nn.Identity()
+                self.predictor = Predictor()
+                self.action_encoder = torch.nn.Identity()
+                self.proprio_encoder = torch.nn.Identity()
+
+            def encode_obs(self, obs):
+                return {"visual": obs["visual"].unsqueeze(-1)}
+
+            def encode_act(self, action):
+                return action
+
+            def encode_proprio(self, proprio):
+                return proprio
+
+            def forward_pred(
+                self,
+                video_features,
+                action_features,
+                proprio_features,
+                predictor_override=None,
+            ):
+                del proprio_features
+                self.seen_shapes = (
+                    tuple(video_features.shape),
+                    tuple(action_features.shape),
+                )
+                scale = predictor_override.planner_input_scale
+                early = scale(video_features[:, :-1] * 0.0) + 1000.0
+                endpoint = action_features[:, -1:, 0]
+                endpoint = scale(endpoint).reshape(-1, 1, 1, 1, 1, 1)
+                return torch.cat((early, endpoint), dim=1), None, None
+
+        world_model = WorldModel()
+        batch = {
+            "context_visual": torch.zeros(1, 3, 1, 1, 1),
+            "goal_visual": torch.zeros(1, 1, 1, 1, 1),
+            "next_visual": torch.tensor([1.0, 2.0, 3.0]).reshape(1, 3, 1, 1, 1),
+            "action": torch.tensor(
+                [[[[0.0], [0.0], [1.0]], [[0.0], [0.0], [2.0]], [[0.0], [0.0], [3.0]]]]
+            ),
+            "context_proprio": torch.zeros(1, 3, 1),
+        }
+        result = planner_landscape_result(
+            world_model,
+            batch,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            mixed_precision=False,
+        )
+        self.assertEqual(result.loss.item(), 0.0)
+        self.assertEqual(result.stats["planner_context_frames"].item(), 3.0)
+        self.assertEqual(world_model.seen_shapes[0][1], 3)
+        self.assertEqual(world_model.seen_shapes[1][1], 3)
+
+    def test_planner_scale_has_its_own_lr_and_no_weight_decay(self):
+        predictor = torch.nn.Module()
+        predictor.projection = torch.nn.Linear(2, 2)
+        predictor.planner_input_scale = PlannerIdentifiedInputScale()
+        optimizer, _, scheduler, wd_scheduler = init_opt(
+            predictor=predictor,
+            action_encoder=None,
+            proprio_encoder=None,
+            encoder=None,
+            iterations_per_epoch=10,
+            start_lr=1.0e-3,
+            ref_lr=1.0e-3,
+            final_lr=1.0e-3,
+            warmup=0,
+            num_epochs=1,
+            ipe_scale=1.0,
+            weight_decay=1.0e-2,
+            final_weight_decay=1.0e-2,
+            planner_scale_lr_multiplier=0.1,
+        )
+        scale_groups = [
+            group
+            for group in optimizer.param_groups
+            if group.get("group_name") == "planner_scale"
+        ]
+        self.assertEqual(len(scale_groups), 1)
+        base_lr = scheduler.step()
+        wd_scheduler.step()
+        self.assertAlmostEqual(scale_groups[0]["lr"], base_lr * 0.1)
+        self.assertEqual(scale_groups[0]["weight_decay"], 0.0)
+        parameter_ids = [
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ]
+        self.assertEqual(len(parameter_ids), len(set(parameter_ids)))
+
     def test_exact_optimizer_budget_owns_scheduler_horizon(self):
         self.assertEqual(
             resolve_optimizer_schedule_steps(9, 10, 83),

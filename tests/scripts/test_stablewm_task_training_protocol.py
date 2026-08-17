@@ -1,11 +1,12 @@
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
 from scripts.generate_stablewm_task_training_configs import TASKS, derive_task_configs
-from src.utils.schedulers import resolve_optimizer_schedule_steps
+from src.utils.schedulers import WarmupCosineSchedule, resolve_optimizer_schedule_steps
 
 
 class TestStableWmTaskTrainingProtocol(unittest.TestCase):
@@ -43,6 +44,27 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
                 self.assertEqual(
                     pi["planner_identified"]["gradient_clip_ownership"],
                     "separate_transition_and_scale",
+                )
+                self.assertEqual(
+                    pi["planner_identified"]["history_size"],
+                    custom["num_hist"],
+                )
+                self.assertEqual(
+                    pi["planner_identified"]["scale_lr_multiplier"],
+                    0.1,
+                )
+                self.assertEqual(
+                    pi["planner_identified"]["groups_per_batch"],
+                    4,
+                )
+                self.assertEqual(
+                    pi["planner_identified"][
+                        "validation_groups_per_batch"
+                    ],
+                    4,
+                )
+                self.assertTrue(
+                    pi["planner_identified"]["validation_at_start"]
                 )
 
     def test_vanilla_restores_exact_pi_config(self):
@@ -101,6 +123,7 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
                     f"step{expected[task]['steps']}",
                     spec["pi_run"],
                 )
+                self.assertIn("_v5_", spec["pi_run"])
                 full_passes, tail_steps = divmod(
                     expected[task]["steps"],
                     expected[task]["steps_per_pass"],
@@ -113,16 +136,43 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
         self.assertEqual(resolve_optimizer_schedule_steps(4, 12796, 51184), 51184)
         self.assertEqual(resolve_optimizer_schedule_steps(5, 10), 50)
 
+    def test_cosine_scheduler_preserves_scale_lr_multiplier(self):
+        optimizer = SimpleNamespace(
+            param_groups=[{}, {"lr_scale": 0.1, "group_name": "planner_scale"}]
+        )
+        scheduler = WarmupCosineSchedule(
+            optimizer,
+            warmup_steps=0,
+            start_lr=5.0e-4,
+            ref_lr=5.0e-4,
+            final_lr=5.0e-4,
+            T_max=10,
+        )
+        base_lr = scheduler.step()
+        self.assertEqual(optimizer.param_groups[0]["lr"], base_lr)
+        self.assertEqual(optimizer.param_groups[1]["lr"], base_lr * 0.1)
+
     def test_launch_and_evaluation_names_are_step_matched(self):
         launcher = Path("scripts/stablewm_task_5pass_autodl.sh").read_text()
         evaluator = Path("scripts/stablewm_task_eval_autodl.sh").read_text()
+        evaluator_protocol = Path(
+            "scripts/eval_stablewm_task_protocol.py"
+        ).read_text()
         summary = Path("scripts/summarize_stablewm_task_multiseed.py").read_text()
         self.assertIn("OPTIMIZER_STEP_BUDGET=111464", launcher)
         self.assertIn("OPTIMIZER_STEP_BUDGET=51184", launcher)
         self.assertIn("LEWM_REFERENCE_PASSES=8", launcher)
         self.assertIn("LEWM_REFERENCE_PASSES=4", launcher)
+        self.assertIn("DEFAULT_TARGET_COMPLETE_PASSES=1", launcher)
+        self.assertIn("DEFAULT_TARGET_COMPLETE_PASSES=4", launcher)
+        self.assertIn("PI_LTC_STOP_AFTER_COMPLETE_PASSES", launcher)
+        self.assertIn("not_scanned_user_confirmed", launcher)
         self.assertIn("vanilla_stepmatched", launcher)
         self.assertIn("vanilla_stepmatched", evaluator)
+        self.assertIn("planner_validation_history.json", evaluator)
+        self.assertIn("PI_CHECKPOINT_NAME", evaluator)
+        self.assertIn("AUDITED_HASHES", evaluator)
+        self.assertIn("heldout_complete_pass_v1", evaluator_protocol)
         self.assertIn('"vanilla_stepmatched": "vanilla"', summary)
 
 

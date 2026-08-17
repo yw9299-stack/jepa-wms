@@ -184,6 +184,7 @@ def _checkpoint_audit(
     expected_optimizer_steps_per_epoch: int,
     expected_optimizer_step_budget: int,
     expected_completed_passes: int | None = None,
+    require_heldout_selection: bool = False,
     smoke: bool = False,
 ) -> dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
@@ -234,6 +235,31 @@ def _checkpoint_audit(
             or any(character not in "0123456789abcdef" for character in initialization_sha256)
         ):
             raise RuntimeError("checkpoint lacks a valid common initialization fingerprint")
+        if owner == "pi" and require_heldout_selection:
+            heldout = checkpoint.get("planner_validation_metrics")
+            selection = checkpoint.get("planner_selection")
+            if not isinstance(heldout, dict) or not isinstance(selection, dict):
+                raise RuntimeError(
+                    "selected PI checkpoint lacks held-out selection provenance"
+                )
+            if (
+                float(heldout.get("planner_landscape_loss", float("inf"))) >= 1.0
+                or float(
+                    heldout.get(
+                        "planner_valid_pairwise_sign_accuracy",
+                        0.0,
+                    )
+                )
+                <= 0.5
+                or int(selection.get("total_optimizer_steps", -1))
+                != expected_total_optimizer_steps
+                or int(selection.get("completed_physical_passes", -1))
+                != completed_passes
+            ):
+                raise RuntimeError(
+                    "selected PI checkpoint fails its held-out eligibility or "
+                    "pass-boundary provenance"
+                )
     return {
         "path": str(path),
         "bytes": path.stat().st_size,
@@ -249,6 +275,10 @@ def _checkpoint_audit(
         "scale_keys": scale_keys,
         "training_provenance": provenance,
         "common_trainable_initialization_sha256": initialization_sha256,
+        "planner_validation_metrics": checkpoint.get(
+            "planner_validation_metrics"
+        ),
+        "planner_selection": checkpoint.get("planner_selection"),
     }
 
 
@@ -273,6 +303,7 @@ def main() -> int:
     parser.add_argument("--expected-training-commit")
     parser.add_argument("--expected-lewm-commit", required=True)
     parser.add_argument("--expected-completed-passes", type=int)
+    parser.add_argument("--require-heldout-selection", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--reuse-complete", action="store_true")
@@ -351,8 +382,28 @@ def main() -> int:
         expected_optimizer_steps_per_epoch=expected_optimizer_steps_per_epoch,
         expected_optimizer_step_budget=expected_optimizer_step_budget,
         expected_completed_passes=args.expected_completed_passes,
+        require_heldout_selection=args.require_heldout_selection,
         smoke=args.smoke,
     )
+    checkpoint_selection_protocol = (
+        "heldout_complete_pass_v1"
+        if args.require_heldout_selection
+        else "configured_checkpoint_v1"
+    )
+    expected_verification_mode = (
+        checkpoint_audit.get("training_provenance", {}).get(
+            "content_hash_mode"
+        )
+    )
+    preflight_verification_mode = preflight_audit.get("verification_mode")
+    if (
+        not args.smoke
+        and preflight_verification_mode is not None
+        and preflight_verification_mode != expected_verification_mode
+    ):
+        raise SystemExit(
+            "[STOP] preflight verification mode differs from checkpoint provenance"
+        )
     arm_root = (
         args.output_root.resolve()
         / args.task
@@ -368,6 +419,11 @@ def main() -> int:
             and existing.get("owner") == args.owner
             and existing.get("arm") == args.arm
             and existing.get("eval_seed") == args.eval_seed
+            and (
+                not args.require_heldout_selection
+                or existing.get("checkpoint_selection_protocol")
+                == checkpoint_selection_protocol
+            )
             and existing.get("checkpoint", {}).get("sha256")
             == checkpoint_audit["sha256"]
             and existing.get("source_h5", {}).get("sha256") == args.source_sha256
@@ -513,7 +569,12 @@ def main() -> int:
     audit = {
         "schema_version": 1,
         "status": "complete",
+        # Checkpoint selection changed in v5, but the task environment, CEM
+        # budget, paired starts, and success criterion did not.  Keep the
+        # established evaluation protocol identifier so existing exact-pair
+        # summaries continue to audit the same estimand.
         "protocol": f"{args.task}_stablewm_exact_jepa_v1",
+        "checkpoint_selection_protocol": checkpoint_selection_protocol,
         "training": False,
         "task": args.task,
         "owner": args.owner,

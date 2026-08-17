@@ -166,6 +166,19 @@ def summarize(root: Path, task: str, draws: int, bootstrap_seed: int) -> dict:
         seed: {arm: _load_arm(root, task, seed, arm) for arm in REQUIRED_ARMS}
         for seed in SEEDS
     }
+    checkpoint_selection_protocols = {
+        audits[seed][arm].get("checkpoint_selection_protocol")
+        for seed in SEEDS
+        for arm in REQUIRED_ARMS
+    }
+    if checkpoint_selection_protocols != {None}:
+        if checkpoint_selection_protocols not in (
+            {"heldout_complete_pass_v1"},
+            {"configured_checkpoint_v1"},
+        ):
+            raise ValueError(
+                "checkpoint-selection protocol differs across evaluation arms"
+            )
     for arm in REQUIRED_ARMS:
         hashes = {
             audits[seed][arm]["checkpoint"]["sha256"]
@@ -196,6 +209,18 @@ def summarize(root: Path, task: str, draws: int, bootstrap_seed: int) -> dict:
             raise ValueError(f"seed {seed}: learned and identity are not the same checkpoint")
         if learned_hash == vanilla_hash:
             raise ValueError(f"seed {seed}: PI and vanilla checkpoints are unexpectedly identical")
+        selected_passes = {
+            arms[arm]["checkpoint"].get("selected_completed_passes")
+            for arm in REQUIRED_ARMS
+        }
+        if checkpoint_selection_protocols == {"heldout_complete_pass_v1"} and (
+            len(selected_passes) != 1
+            or next(iter(selected_passes)) is None
+            or int(next(iter(selected_passes))) < 1
+        ):
+            raise ValueError(
+                f"seed {seed}: PI/identity/vanilla selected pass differs"
+            )
         learned_initialization = arms["learned"]["checkpoint"].get(
             "common_trainable_initialization_sha256"
         )

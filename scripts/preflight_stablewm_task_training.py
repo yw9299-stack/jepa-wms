@@ -154,21 +154,40 @@ def main() -> int:
         expected_branches_per_group=planner_cfg["expected_branches_per_group"],
         expected_config_sha256=planner_cfg["expected_config_sha256"],
         frameskip=custom["frameskip"],
+        action_skip=custom["action_skip"],
+        history_size=custom["num_hist"],
         goal_offset_steps=planner_cfg["goal_offset_steps"],
     )
     planner_train, planner_valid = split_planner_groups_by_physical_episode(
         planner, train_episode_ids
     )
     planner_sample = planner[0]
-    if tuple(planner_sample["action"].shape) != (4, 1, expected_action_width):
+    if tuple(planner_sample["context_visual"].shape) != (
+        custom["num_hist"],
+        3,
+        224,
+        224,
+    ):
+        raise SystemExit(
+            f"[STOP] planner context shape={tuple(planner_sample['context_visual'].shape)}"
+        )
+    if tuple(planner_sample["action"].shape) != (
+        4,
+        custom["num_hist"],
+        expected_action_width,
+    ):
         raise SystemExit(f"[STOP] planner action shape={tuple(planner_sample['action'].shape)}")
-    if tuple(planner_sample["context_proprio"].shape) != (1, spec["proprio_dim"]):
+    if tuple(planner_sample["context_proprio"].shape) != (
+        custom["num_hist"],
+        spec["proprio_dim"],
+    ):
         raise SystemExit(
             f"[STOP] planner proprio shape={tuple(planner_sample['context_proprio'].shape)}"
         )
 
     result = {
         "status": "PASS",
+        "verification_mode": "sha256",
         "task": args.task,
         "repository_commit": commit,
         "training_configs": {
@@ -201,7 +220,9 @@ def main() -> int:
             "used_microbatches": used_microbatches,
             "dropped_microbatches": loader_microbatches - used_microbatches,
             "optimizer_steps_per_pass": steps_per_pass,
-            "optimizer_steps_five_passes": steps_per_pass * 5,
+            "optimizer_step_budget": int(
+                pi["optimization"]["transition_model"]["total_optimizer_steps"]
+            ),
         },
         "planner": {
             "sidecar_path": str(args.sidecar.resolve()),
@@ -211,6 +232,10 @@ def main() -> int:
             "train_groups": len(planner_train),
             "valid_groups": len(planner_valid),
             "branches_per_group": planner.branches_per_group,
+            "history_size": planner.history_size,
+            "action_skip": planner.action_skip,
+            "sample_context_shape": list(planner_sample["context_visual"].shape),
+            "sample_action_shape": list(planner_sample["action"].shape),
             "sidecar_sha256": args.sidecar_sha256.lower(),
         },
         "cuda": {

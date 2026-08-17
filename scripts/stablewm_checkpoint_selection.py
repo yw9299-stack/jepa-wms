@@ -26,12 +26,17 @@ def expected_checkpoint_schedule(
     if expected_completed_passes < 1:
         raise ValueError("expected completed passes must be positive")
     total_optimizer_steps = expected_completed_passes * optimizer_steps_per_pass
-    if total_optimizer_steps >= configured_optimizer_step_budget:
-        raise ValueError("pass-boundary selection must precede the configured final horizon")
+    if total_optimizer_steps > configured_optimizer_step_budget:
+        raise ValueError("pass-boundary selection cannot exceed the configured final horizon")
+    training_complete = total_optimizer_steps == configured_optimizer_step_budget
     return {
         "epoch": int(expected_completed_passes),
         "total_optimizer_steps": total_optimizer_steps,
         "optimizer_step_in_epoch": 0,
-        "training_complete": False,
-        "selection_policy": "native_complete_pass_boundary",
+        "training_complete": training_complete,
+        "selection_policy": (
+            "configured_final_horizon"
+            if training_complete
+            else "native_complete_pass_boundary"
+        ),
     }

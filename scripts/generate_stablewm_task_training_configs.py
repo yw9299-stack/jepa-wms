@@ -19,8 +19,8 @@ BASE_CONFIG = Path("configs/pi_ltc_cross_model/pointmaze_jepa_wm_pi_ltc_5pass.ya
 
 TASKS = {
     "pusht": {
-        "pi_run": "pusht_jepa_wm_pi_ltc_step111464_v4_seed3072",
-        "vanilla_run": "pusht_jepa_wm_vanilla_step111464_v4_seed3072",
+        "pi_run": "pusht_jepa_wm_pi_ltc_step111464_v5_seed3072",
+        "vanilla_run": "pusht_jepa_wm_vanilla_step111464_v5_seed3072",
         "lewm_reference": "pusht_ltc_planner_identified_global_clean8p",
         "lewm_reference_passes": 8,
         "optimizer_step_budget": 111464,
@@ -40,8 +40,8 @@ TASKS = {
         "sidecar_config_sha256": "35b55bbd2cdfde01ae133fe86254dc720116885c69e31165bf3abdb08fc5659b",
     },
     "cube": {
-        "pi_run": "cube_jepa_wm_pi_ltc_step51184_v4_seed3072",
-        "vanilla_run": "cube_jepa_wm_vanilla_step51184_v4_seed3072",
+        "pi_run": "cube_jepa_wm_pi_ltc_step51184_v5_seed3072",
+        "vanilla_run": "cube_jepa_wm_vanilla_step51184_v5_seed3072",
         "lewm_reference": "cube_ltc_planner_identified_global_step51184_clean4p",
         "lewm_reference_passes": 4,
         "optimizer_step_budget": 51184,
@@ -101,6 +101,8 @@ def derive_task_configs(base: dict, task: str) -> tuple[dict, dict]:
         raise ValueError("base config does not enable planner-identified input scale")
     if pi["planner_identified"].get("enabled") is not True:
         raise ValueError("base config does not enable the planner objective")
+    if int(pi["data"]["custom"].get("num_hist", 0)) != 3:
+        raise ValueError("base transition template is not the audited 3-frame model")
     optimization = pi["optimization"]["transition_model"]
     if (
         int(optimization["num_epochs"]) != 5
@@ -143,6 +145,17 @@ def derive_task_configs(base: dict, task: str) -> tuple[dict, dict]:
                 "strictly_greater_than_max_eps_or_1e-4_batch_median"
             ),
             "gradient_clip_ownership": "separate_transition_and_scale",
+            "history_size": 3,
+            # Three-frame AdaLN attention is substantially larger than the
+            # erroneous single-frame v4 planner pass.  Four groups still
+            # provide 24 candidate-pair comparisons per optimizer update while
+            # keeping the frozen-predictor graph inside a 24 GB GPU budget.
+            "groups_per_batch": 4,
+            "validation_groups_per_batch": 4,
+            "validation_at_start": True,
+            "scale_lr_multiplier": 0.1,
+            "canary_max_abs_log_scale_drift_per_1000_steps": 0.1,
+            "canary_require_heldout_non_degradation": True,
         }
     )
 
@@ -193,8 +206,8 @@ def main() -> int:
         raise SystemExit("[STOP] tracked repository files are dirty")
     spec = TASKS[args.task]
     manifest = {
-        "schema_version": 1,
-        "protocol": f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_lewm_stepmatched_v4",
+        "schema_version": 2,
+        "protocol": f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_lewm_stepmatched_v5",
         "repository_commit": commit,
         "repository_tracked_dirty": dirty,
         "content_hash_mode": os.environ.get("PI_LTC_CONTENT_HASH_MODE", "sha256"),
@@ -208,6 +221,18 @@ def main() -> int:
             "folder": [pi["folder"], vanilla["folder"]],
             "model.predictor.planner_identified_input_scale": [True, False],
             "planner_identified": ["task sidecar objective", {"enabled": False}],
+        },
+        "planner_adaptation": {
+            "context_history_frames": pi["planner_identified"]["history_size"],
+            "action_and_proprio_history_aligned": True,
+            "scale_lr_multiplier": pi["planner_identified"][
+                "scale_lr_multiplier"
+            ],
+            "scale_weight_decay": 0.0,
+            "heldout_checkpoint_selection": (
+                "minimum normalized pairwise landscape loss at complete pass boundaries"
+            ),
+            "objective_and_gradient_ownership_unchanged": True,
         },
         "schedule": {
             "lewm_reference": spec["lewm_reference"],

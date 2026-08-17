@@ -39,13 +39,20 @@ class PlannerLandscapeH5Dataset(Dataset):
         expected_branches_per_group=None,
         expected_config_sha256=None,
         frameskip=5,
+        action_skip=1,
+        history_size=None,
         goal_offset_steps=25,
     ):
         self.source_h5_path = Path(source_h5)
         self.sidecar_h5_path = Path(sidecar_h5)
         self.transform = transform
         self.frameskip = int(frameskip)
+        self.action_skip = int(action_skip)
         self.goal_offset_steps = int(goal_offset_steps)
+        if self.frameskip < 1 or self.action_skip < 1:
+            raise ValueError("planner frameskip and action_skip must be positive")
+        if self.frameskip % self.action_skip:
+            raise ValueError("planner frameskip must be divisible by action_skip")
         self.action_mean = torch.as_tensor(action_mean, dtype=torch.float32)
         self.action_std = torch.as_tensor(action_std, dtype=torch.float32)
         self.proprio_mean = torch.as_tensor(proprio_mean, dtype=torch.float32)
@@ -93,6 +100,19 @@ class PlannerLandscapeH5Dataset(Dataset):
                 )
             if int(sidecar.attrs["frameskip"]) != self.frameskip:
                 raise ValueError("planner sidecar frameskip does not match training config")
+            if "history_size" not in sidecar.attrs:
+                raise ValueError("planner sidecar lacks the audited history_size attribute")
+            sidecar_history_size = int(sidecar.attrs["history_size"])
+            if history_size is None:
+                history_size = sidecar_history_size
+            self.history_size = int(history_size)
+            if self.history_size < 1:
+                raise ValueError("planner history_size must be positive")
+            if sidecar_history_size != self.history_size:
+                raise ValueError(
+                    "planner sidecar history_size does not match training context: "
+                    f"sidecar={sidecar_history_size}, training={self.history_size}"
+                )
             for key in (
                 "selected_context_rows",
                 "selected_episode_id",
@@ -159,13 +179,21 @@ class PlannerLandscapeH5Dataset(Dataset):
             if not np.array_equal(source_metadata_ids, self.episode_ids):
                 raise ValueError("planner sidecar metadata episode IDs do not match source rows")
             episode_end = self.source_metadata.episode_ends_for_rows(self.context_rows)
+            episode_positions = self.source_metadata.episode_positions_for_rows(
+                self.context_rows
+            )
+            episode_start = self.source_metadata.episode_offsets[episode_positions]
+            history_start_rows = (
+                self.context_rows - (self.history_size - 1) * self.frameskip
+            )
             goal_rows = self.context_rows + self.goal_offset_steps
-            valid = goal_rows < episode_end
+            valid = (goal_rows < episode_end) & (history_start_rows >= episode_start)
             self.group_indices = np.flatnonzero(valid).astype(np.int64)
             self.context_rows = self.context_rows[valid]
             self.episode_ids = self.episode_ids[valid]
             self.physical_episode_ids = self.physical_episode_ids[valid]
             self.goal_rows = goal_rows[valid]
+            self.history_start_rows = history_start_rows[valid]
             self.raw_action_dim = self.source_metadata.action_dim
 
     def __len__(self):
@@ -202,36 +230,74 @@ class PlannerLandscapeH5Dataset(Dataset):
         local_index = int(index)
         group_index = int(self.group_indices[local_index])
         context_row = int(self.context_rows[local_index])
+        history_start_row = int(self.history_start_rows[local_index])
         start = group_index * self.branches_per_group
         stop = start + self.branches_per_group
 
-        context = np.asarray(source["pixels"][context_row])
+        history_rows = (
+            history_start_row
+            + np.arange(self.history_size, dtype=np.int64) * self.frameskip
+        )
+        context = np.asarray(source["pixels"][history_rows])
         if "goal_pixels" in source:
             goal = np.asarray(source["goal_pixels"][context_row])
         else:
             goal = np.asarray(source["pixels"][int(self.goal_rows[local_index])])
         next_pixels = np.asarray(sidecar["next_pixels"][start:stop])
-        pixels = np.concatenate((context[None], goal[None], next_pixels), axis=0)
+        pixels = np.concatenate((context, goal[None], next_pixels), axis=0)
         pixels = torch.from_numpy(pixels.astype(np.float32) / 255.0).permute(0, 3, 1, 2)
         if self.transform is not None:
             pixels = self.transform(pixels)
 
-        action = torch.from_numpy(np.asarray(sidecar["raw_action"][start:stop], dtype=np.float32))
-        action = (action - self.action_mean) / self.action_std
-        action = action.reshape(self.branches_per_group, 1, -1)
+        candidate_action = torch.from_numpy(
+            np.asarray(
+                sidecar["raw_action"][start:stop, :: self.action_skip],
+                dtype=np.float32,
+            )
+        )
+        candidate_action = (candidate_action - self.action_mean) / self.action_std
+        candidate_action = candidate_action.reshape(
+            self.branches_per_group,
+            1,
+            -1,
+        )
+        if self.history_size > 1:
+            prefix_action_rows = (
+                history_start_row
+                + np.arange(
+                    (self.history_size - 1)
+                    * self.frameskip
+                    // self.action_skip,
+                    dtype=np.int64,
+                )
+                * self.action_skip
+            )
+            prefix_action = torch.from_numpy(
+                np.asarray(source["action"][prefix_action_rows], dtype=np.float32)
+            )
+            prefix_action = (prefix_action - self.action_mean) / self.action_std
+            prefix_action = prefix_action.reshape(self.history_size - 1, -1)
+            prefix_action = prefix_action.unsqueeze(0).expand(
+                self.branches_per_group,
+                -1,
+                -1,
+            )
+            action = torch.cat((prefix_action, candidate_action), dim=1)
+        else:
+            action = candidate_action
         proprio = torch.from_numpy(
             self.source_metadata.load_proprio(
                 source,
-                np.asarray([context_row], dtype=np.int64),
-            )[0]
+                history_rows,
+            )
         )
         proprio = (proprio - self.proprio_mean) / self.proprio_std
         return {
-            "context_visual": pixels[0:1],
-            "goal_visual": pixels[1:2],
-            "next_visual": pixels[2:],
+            "context_visual": pixels[: self.history_size],
+            "goal_visual": pixels[self.history_size : self.history_size + 1],
+            "next_visual": pixels[self.history_size + 1 :],
             "action": action,
-            "context_proprio": proprio.unsqueeze(0),
+            "context_proprio": proprio,
             "group_id": torch.tensor(group_index, dtype=torch.int64),
         }
 

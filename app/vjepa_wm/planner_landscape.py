@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -226,6 +226,7 @@ def planner_landscape_result(
     mixed_precision,
     target_energy_eps=1.0e-8,
     target_energy_relative_floor=0.0,
+    compute_scale_gradient=True,
 ):
     """Compute the landscape objective and its gradient only for log(scale).
 
@@ -240,14 +241,29 @@ def planner_landscape_result(
     action = batch["action"].to(device, non_blocking=True)
     context_proprio = batch["context_proprio"].to(device, non_blocking=True)
     groups, candidates = next_visual.shape[:2]
+    history_size = context.shape[1]
+    if history_size < 1:
+        raise ValueError("planner context must contain at least one frame")
+    if goal.shape[:2] != (groups, 1):
+        raise ValueError("planner goal must contain exactly one frame per group")
+    if action.shape[:3] != (groups, candidates, history_size):
+        raise ValueError(
+            "planner actions must align with every context frame: "
+            f"context={tuple(context.shape)}, action={tuple(action.shape)}"
+        )
+    if context_proprio.shape[:2] != (groups, history_size):
+        raise ValueError(
+            "planner proprio must align with every context frame: "
+            f"context={tuple(context.shape)}, proprio={tuple(context_proprio.shape)}"
+        )
 
     all_visual = torch.cat((context, goal, next_visual), dim=1)
     with _preserve_eval_mode(world_model), _scale_only_predictor_graph(world_model) as (predictor, scale):
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
             encoded = world_model.encode_obs({"visual": all_visual, "proprio": None})["visual"]
-            context_features = encoded[:, 0:1]
-            goal_features = encoded[:, 1:2]
-            next_features = encoded[:, 2:]
+            context_features = encoded[:, :history_size]
+            goal_features = encoded[:, history_size : history_size + 1]
+            next_features = encoded[:, history_size + 1 :]
             action_features = world_model.encode_act(_flatten_group_candidates(action))
             proprio_features = world_model.encode_proprio(context_proprio)
 
@@ -258,15 +274,31 @@ def planner_landscape_result(
         repeated_goal = _flatten_group_candidates(repeated_goal)
         repeated_proprio = _flatten_group_candidates(repeated_proprio)
 
-        with scale.landscape_gradient(), torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
+        scale_context = scale.landscape_gradient() if compute_scale_gradient else nullcontext()
+        gradient_context = torch.enable_grad() if compute_scale_gradient else torch.no_grad()
+        with scale_context, gradient_context, torch.amp.autocast(
+            "cuda",
+            dtype=dtype,
+            enabled=mixed_precision,
+        ):
             predicted, _, _ = world_model.forward_pred(
                 repeated_context,
                 action_features,
                 repeated_proprio,
                 predictor_override=predictor,
             )
+            if predicted.shape[1] != history_size:
+                raise ValueError(
+                    "planner predictor output does not match context/action history: "
+                    f"predicted={tuple(predicted.shape)}, history_size={history_size}"
+                )
+            predicted_endpoint = predicted[:, -1:]
             predicted_cost = (
-                (predicted.float() - repeated_goal.float()).square().flatten(1).mean(dim=1).reshape(groups, candidates)
+                (predicted_endpoint.float() - repeated_goal.float())
+                .square()
+                .flatten(1)
+                .mean(dim=1)
+                .reshape(groups, candidates)
             )
             real_cost = (next_features.float() - goal_features.float()).square().flatten(2).mean(dim=2)
             loss, landscape_diagnostics = normalized_pairwise_landscape_error(
@@ -277,19 +309,28 @@ def planner_landscape_result(
                 return_diagnostics=True,
             )
 
-        scale_gradient = torch.autograd.grad(
-            loss,
-            scale.log_scale,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=False,
-        )[0].detach()
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        if compute_scale_gradient:
+            scale_gradient = torch.autograd.grad(
+                loss,
+                scale.log_scale,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0].detach()
+        else:
+            scale_gradient = scale.log_scale.detach().new_zeros(())
+    if (
+        compute_scale_gradient
+        and dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    ):
         dist.all_reduce(scale_gradient, op=dist.ReduceOp.SUM)
         scale_gradient.div_(dist.get_world_size())
 
     predicted_std = predicted_cost.detach().std(dim=1).mean()
     real_std = real_cost.detach().std(dim=1).mean()
+    response_ratio = predicted_std / real_std.clamp_min(float(target_energy_eps) ** 0.5)
     valid_group = landscape_diagnostics["valid_group"]
     if bool(valid_group.any()):
         valid_sign_accuracy = pairwise_sign_accuracy(
@@ -304,6 +345,11 @@ def planner_landscape_result(
         "planner_valid_pairwise_sign_accuracy": valid_sign_accuracy,
         "planner_predicted_cost_std": predicted_std,
         "planner_real_cost_std": real_std,
+        "planner_predicted_to_real_cost_std_ratio": response_ratio,
+        "planner_zero_difference_baseline": predicted_cost.new_tensor(1.0),
+        "planner_improvement_over_zero_difference": predicted_cost.new_tensor(1.0)
+        - loss.detach(),
+        "planner_context_frames": predicted_cost.new_tensor(float(history_size)),
         "planner_valid_group_count": landscape_diagnostics["valid_group_count"].float(),
         "planner_valid_group_fraction": landscape_diagnostics["valid_group_fraction"],
         "planner_target_energy_min": landscape_diagnostics["target_energy_min"],

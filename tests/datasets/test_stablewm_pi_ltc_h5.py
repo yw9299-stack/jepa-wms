@@ -70,9 +70,10 @@ class TestStableWmPiLtcH5(unittest.TestCase):
             sidecar.attrs["complete"] = True
             sidecar.attrs["branches_per_state"] = branches
             sidecar.attrs["frameskip"] = 5
+            sidecar.attrs["history_size"] = 3
             sidecar.create_dataset(
                 "selected_context_rows",
-                data=np.arange(groups, dtype=np.int64) * episode_length,
+                data=np.arange(groups, dtype=np.int64) * episode_length + 10,
             )
             sidecar.create_dataset(
                 "selected_episode_id",
@@ -153,14 +154,24 @@ class TestStableWmPiLtcH5(unittest.TestCase):
             proprio_mean=metadata["train"].proprio_mean,
             proprio_std=metadata["train"].proprio_std,
             frameskip=5,
-            goal_offset_steps=25,
+            action_skip=1,
+            history_size=3,
+            goal_offset_steps=5,
         )
         sample = planner[0]
-        self.assertEqual(sample["context_visual"].shape, (1, 3, 4, 4))
+        self.assertEqual(sample["context_visual"].shape, (3, 3, 4, 4))
         self.assertEqual(sample["goal_visual"].shape, (1, 3, 4, 4))
         self.assertEqual(sample["next_visual"].shape, (4, 3, 4, 4))
-        self.assertEqual(sample["action"].shape, (4, 1, 10))
-        self.assertEqual(sample["context_proprio"].shape, (1, 4))
+        self.assertEqual(sample["action"].shape, (4, 3, 10))
+        self.assertEqual(sample["context_proprio"].shape, (3, 4))
+        expected_prefix = np.arange(20, dtype=np.float32).reshape(10, 2)
+        expected_prefix = (
+            expected_prefix - metadata["train"].action_mean.numpy()
+        ) / metadata["train"].action_std.numpy()
+        np.testing.assert_allclose(
+            sample["action"][0, :2].numpy(),
+            expected_prefix.reshape(2, 10),
+        )
         train_groups, valid_groups = split_planner_groups_by_physical_episode(
             planner,
             train_episode_ids,
@@ -216,9 +227,10 @@ class TestStableWmPiLtcH5(unittest.TestCase):
             sidecar.attrs["complete"] = True
             sidecar.attrs["branches_per_state"] = branches
             sidecar.attrs["frameskip"] = 5
+            sidecar.attrs["history_size"] = 3
             sidecar.create_dataset(
                 "selected_context_rows",
-                data=np.arange(groups, dtype=np.int64) * episode_length,
+                data=np.arange(groups, dtype=np.int64) * episode_length + 10,
             )
             sidecar.create_dataset(
                 "selected_episode_id",
@@ -289,8 +301,11 @@ class TestStableWmPiLtcH5(unittest.TestCase):
             proprio_std=metadata["train"].proprio_std,
             source_metadata=metadata["train"],
             expected_protocol="pusht_planner_counterfactual_v1",
+            action_skip=1,
+            history_size=3,
+            goal_offset_steps=5,
         )
-        self.assertEqual(planner[0]["context_proprio"].shape, (1, 4))
+        self.assertEqual(planner[0]["context_proprio"].shape, (3, 4))
         train_groups, valid_groups = split_planner_groups_by_physical_episode(
             planner, train_episode_ids
         )
@@ -342,11 +357,14 @@ class TestStableWmPiLtcH5(unittest.TestCase):
             proprio_std=np.ones(6, dtype=np.float32),
             source_metadata=metadata,
             expected_protocol="cube_planner_counterfactual_v1",
+            action_skip=1,
+            history_size=3,
+            goal_offset_steps=5,
         )
-        self.assertEqual(planner[0]["action"].shape, (4, 1, 25))
+        self.assertEqual(planner[0]["action"].shape, (4, 3, 25))
         np.testing.assert_array_equal(
-            planner[0]["context_proprio"][0].numpy(),
-            merged,
+            planner[0]["context_proprio"].numpy(),
+            np.repeat(merged[None], 3, axis=0),
         )
 
     def test_expected_dimensions_are_hard_stops(self):

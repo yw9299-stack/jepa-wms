@@ -80,6 +80,8 @@ class WarmupCosineSchedule(object):
 
         for group in self.optimizer.param_groups:
             group["lr"] = new_lr
+            if "lr_scale" in group:
+                group["lr"] *= group["lr_scale"]
 
         return new_lr
 
@@ -124,5 +126,7 @@ class LinearDecaySchedule(object):
         new_lr = self.ref_lr + progress * (self.final_lr - self.ref_lr)
         for group in self.optimizer.param_groups:
             group["lr"] = new_lr
+            if "lr_scale" in group:
+                group["lr"] *= group["lr_scale"]
 
         return new_lr

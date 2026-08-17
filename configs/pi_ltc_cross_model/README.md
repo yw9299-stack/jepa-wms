@@ -28,7 +28,68 @@ is detached. The planner-landscape objective updates only
 `log_input_scale`. The frozen DINOv2 encoder receives no gradient from either
 objective.
 
-The native `latest.pth.tar` and per-epoch `e*.pth.tar` files are retained.
+## v5 history-aligned adaptation
+
+The v5 PushT/Cube protocol fixes an implementation mismatch in the earlier v4
+transfer runs.  The transition model is trained with three context frames, so
+each planner group now supplies the same three visual frames, the corresponding
+three action blocks, and three proprio states.  The first two action blocks are
+the canonical source-episode prefix and the last block is the counterfactual
+branch.  The planner cost is computed from the final predicted endpoint only.
+The sidecar's existing `history_size=3` attribute is checked against
+`data.custom.num_hist`; no sidecar or source-data regeneration is required.
+
+This does not change the PI-LTC architecture, positive parameterization, loss
+equation, or gradient ownership.  It changes only the data presented to that
+loss and its optimization protocol:
+
+- `log_input_scale` has a dedicated AdamW parameter group at 0.1x the
+  transition-model learning rate and zero weight decay;
+- the planner-only group batch is four (24 candidate pairs/update), preventing
+  three-frame AdaLN attention from exceeding a 24 GB GPU; the ordinary JEPA
+  microbatch 16 and accumulation 8 are unchanged;
+- the physical-episode validation split is evaluated at initialization and at
+  every completed data pass;
+- `jepa-planner-best.pth.tar` is selected only at a complete pass boundary and
+  only when held-out normalized landscape loss is below the zero-response
+  baseline of 1 and pairwise sign accuracy is above 0.5;
+- `planner_validation_history.json` records all boundary metrics and the chosen
+  pass; matched evaluation uses the vanilla `jepa-eN.pth.tar` from that same
+  pass;
+- canaries record held-out before/after metrics and reject excessive log-scale
+  drift instead of clamping the model.
+
+The v4 checkpoints remain immutable historical artifacts and must not be
+resumed into v5: the optimizer state has a different parameter-group layout.
+Start v5 from the same canonical public initialization.  A recommended first
+launch is a 2,000-update PI canary:
+
+```bash
+NO_FILE_SCAN=1 PREFLIGHT_ONLY=0 CANARY_OPTIMIZER_STEPS=2000 \
+  bash scripts/stablewm_task_5pass_autodl.sh pusht pi
+```
+
+Only after `canary_summary.json` reports `canary_gate_passed: true` should the
+PI arm be launched, followed by its matched vanilla arm.  The launcher now
+stops natively at a complete physical-pass boundary: PushT defaults to one pass
+and Cube to four.  No relay process or termination signal is required.  To
+extend both PushT arms from their saved pass-1 checkpoints through pass 2, run
+the same commands with `TARGET_COMPLETE_PASSES=2`; strict resume retains the
+configured long-horizon scheduler and all optimizer state.
+
+```bash
+NO_FILE_SCAN=1 PREFLIGHT_ONLY=0 TARGET_COMPLETE_PASSES=1 \
+  bash scripts/stablewm_task_5pass_autodl.sh pusht pi
+NO_FILE_SCAN=1 PREFLIGHT_ONLY=0 TARGET_COMPLETE_PASSES=1 \
+  bash scripts/stablewm_task_5pass_autodl.sh pusht vanilla
+```
+
+With `NO_FILE_SCAN=1`, the launcher never hashes or samples either large HDF5.
+It writes a small audit explicitly marked `not_scanned_user_confirmed` from
+path, byte size, mtime, and config hashes; evaluation recovers and checks that
+same provenance marker instead of silently presenting it as a content hash.
+
+The native `latest.pth.tar` and per-pass `e*.pth.tar` files are retained.
 Running the same command again resumes from `latest.pth.tar`; there is no
 additional step-aligned checkpoint callback.
 

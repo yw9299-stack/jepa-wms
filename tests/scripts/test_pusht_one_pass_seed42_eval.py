@@ -34,12 +34,27 @@ class TestCheckpointSelection(unittest.TestCase):
         self.assertEqual(final["optimizer_step_in_epoch"], 80)
         self.assertTrue(final["training_complete"])
 
-    def test_pass_boundary_must_precede_final_horizon(self):
-        with self.assertRaisesRegex(ValueError, "precede"):
+    def test_complete_final_pass_is_a_valid_selected_boundary(self):
+        selected = expected_checkpoint_schedule(
+            optimizer_steps_per_pass=12796,
+            configured_optimizer_step_budget=51184,
+            expected_completed_passes=4,
+        )
+        self.assertEqual(selected["epoch"], 4)
+        self.assertEqual(selected["total_optimizer_steps"], 51184)
+        self.assertEqual(selected["optimizer_step_in_epoch"], 0)
+        self.assertTrue(selected["training_complete"])
+        self.assertEqual(
+            selected["selection_policy"],
+            "configured_final_horizon",
+        )
+
+    def test_pass_boundary_cannot_exceed_final_horizon(self):
+        with self.assertRaisesRegex(ValueError, "exceed"):
             expected_checkpoint_schedule(
                 optimizer_steps_per_pass=10,
                 configured_optimizer_step_budget=20,
-                expected_completed_passes=2,
+                expected_completed_passes=3,
             )
 
 
