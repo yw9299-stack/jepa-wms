@@ -372,6 +372,7 @@ def load_checkpoint_state_dict(
     load_prop_enc=True,
     load_opt_scale_epoch=True,
     strict_resume=False,
+    strict_model_state=False,
 ):
     """Load state dicts from checkpoint data onto model modules.
 
@@ -388,6 +389,8 @@ def load_checkpoint_state_dict(
         load_act_enc (bool): Whether to load action encoder weights.
         load_prop_enc (bool): Whether to load proprio encoder weights.
         load_opt_scale_epoch (bool): Whether to load optimizer and scaler state.
+        strict_model_state (bool): Require exact model-state key matches without
+            enabling optimizer/resume provenance checks.
 
     Returns:
         tuple: (predictor, action_encoder, proprio_encoder, opt, scaler, epoch)
@@ -395,6 +398,12 @@ def load_checkpoint_state_dict(
     epoch = checkpoint.get("epoch", -1)
 
     # -- loading predictor
+    if (
+        predictor is not None
+        and checkpoint.get("predictor") is None
+        and (strict_resume or strict_model_state)
+    ):
+        raise RuntimeError("strict model checkpoint has no predictor state")
     if predictor is not None and checkpoint.get("predictor") is not None:
         pretrained_dict = clean_state_dict(checkpoint["predictor"])
 
@@ -404,7 +413,10 @@ def load_checkpoint_state_dict(
             "state_encoder.bias": "proprio_encoder.bias",
         }
         pretrained_dict = {key_mapping.get(k, k): v for k, v in pretrained_dict.items()}
-        msg = predictor.load_state_dict(pretrained_dict, strict=strict_resume)
+        msg = predictor.load_state_dict(
+            pretrained_dict,
+            strict=bool(strict_resume or strict_model_state),
+        )
         logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
         # Check for expected missing keys (attention mask buffers) and inform user
@@ -418,21 +430,31 @@ def load_checkpoint_state_dict(
     # -- loading action encoder
     if load_act_enc and action_encoder:
         if checkpoint.get("action_encoder") is None:
-            if strict_resume:
-                raise RuntimeError("strict resume checkpoint has no action encoder state")
+            if strict_resume or strict_model_state:
+                raise RuntimeError(
+                    "strict model checkpoint has no action encoder state"
+                )
         else:
             pretrained_dict = clean_state_dict(checkpoint["action_encoder"])
-            msg = action_encoder.load_state_dict(pretrained_dict, strict=strict_resume)
+            msg = action_encoder.load_state_dict(
+                pretrained_dict,
+                strict=bool(strict_resume or strict_model_state),
+            )
             logger.info(f"loaded pretrained action encoder from epoch {epoch} with msg: {msg}")
 
     # -- loading proprio encoder
     if load_prop_enc and proprio_encoder:
         if checkpoint.get("proprio_encoder") is None:
-            if strict_resume:
-                raise RuntimeError("strict resume checkpoint has no proprio encoder state")
+            if strict_resume or strict_model_state:
+                raise RuntimeError(
+                    "strict model checkpoint has no proprio encoder state"
+                )
         else:
             pretrained_dict = clean_state_dict(checkpoint["proprio_encoder"])
-            msg = proprio_encoder.load_state_dict(pretrained_dict, strict=strict_resume)
+            msg = proprio_encoder.load_state_dict(
+                pretrained_dict,
+                strict=bool(strict_resume or strict_model_state),
+            )
             logger.info(f"loaded pretrained proprio encoder from epoch {epoch} with msg: {msg}")
 
     # -- loading optimizer
@@ -519,6 +541,8 @@ def load_checkpoint(
     expected_gradient_accumulation_steps=None,
     expected_training_provenance=None,
     expected_common_trainable_initialization_sha256=None,
+    expected_checkpoint_metadata=None,
+    strict_model_state=False,
 ):
     """Load checkpoint from local file path and apply to model modules.
 
@@ -540,11 +564,25 @@ def load_checkpoint(
         load_stats (bool): Unused, kept for backward compatibility.
         train_predictor (bool): If True, return predictor epoch; used for epoch tracking.
         train_heads (bool): If True, return head epoch instead of predictor epoch.
+        expected_checkpoint_metadata (dict | None): Exact top-level metadata
+            values required before applying any checkpoint state.
+        strict_model_state (bool): Require exact predictor/action/proprio state
+            matches independently of strict optimizer-resume checks.
 
     Returns:
         tuple: (predictor, action_encoder, proprio_encoder, heads, opt, scaler, epoch)
     """
     checkpoint = fetch_checkpoint(r_path, device="cpu")
+    if expected_checkpoint_metadata is not None:
+        if not isinstance(expected_checkpoint_metadata, dict):
+            raise TypeError("expected_checkpoint_metadata must be a dictionary")
+        for key, expected in expected_checkpoint_metadata.items():
+            actual = checkpoint.get(key)
+            if actual != expected:
+                raise RuntimeError(
+                    "checkpoint metadata mismatch for "
+                    f"{key}: actual={actual!r}, expected={expected!r}"
+                )
     if strict_resume:
         for key, expected in (
             ("optimizer_steps_per_epoch", expected_optimizer_steps_per_epoch),
@@ -600,6 +638,7 @@ def load_checkpoint(
         load_prop_enc=load_prop_enc,
         load_opt_scale_epoch=load_opt_scale_epoch,
         strict_resume=strict_resume,
+        strict_model_state=strict_model_state,
     )
 
     # Load heads from separate files if requested

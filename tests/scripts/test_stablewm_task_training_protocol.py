@@ -163,6 +163,12 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
         evaluator_protocol = Path(
             "scripts/eval_stablewm_task_protocol.py"
         ).read_text()
+        checkpoint_sweeper = Path(
+            "scripts/pusht_canary_extended_scale_sweep_autodl.sh"
+        ).read_text()
+        checkpoint_utils = Path("app/vjepa_wm/utils.py").read_text(
+            encoding="utf-8"
+        )
         summary = Path("scripts/summarize_stablewm_task_multiseed.py").read_text()
         self.assertIn("OPTIMIZER_STEP_BUDGET=111464", launcher)
         self.assertIn("OPTIMIZER_STEP_BUDGET=51184", launcher)
@@ -176,7 +182,21 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
         self.assertIn("canary diagnostic checkpoint audit is missing", launcher)
         self.assertIn("checkpoint_role=\"canary_diagnostic\"", trainer)
         self.assertIn("canary_scale_sweep.json", trainer)
-        self.assertIn("evaluate_canary_scale_sweep", trainer)
+        self.assertIn("evaluate_planner_scale_sweep", trainer)
+        self.assertIn("planner_scale_sweep_only", trainer)
+        self.assertIn("optimizer_steps_executed", trainer)
+        self.assertIn("strict_model_state=planner_scale_sweep_only", trainer)
+        self.assertIn("expected_checkpoint_metadata", checkpoint_utils)
+        self.assertIn("strict_model_state", checkpoint_utils)
+        self.assertIn("actual != expected", checkpoint_utils)
+        self.assertIn("strict_resume or strict_model_state", checkpoint_utils)
+        self.assertIn("CANARY_TRAINING_COMMIT", checkpoint_sweeper)
+        self.assertIn("planner_scale_sweep_only", checkpoint_sweeper)
+        self.assertIn("planner_scale_sweep_checkpoint_sha256", checkpoint_sweeper)
+        self.assertIn("checkpoint_role", checkpoint_sweeper)
+        self.assertIn("total_optimizer_steps", checkpoint_sweeper)
+        self.assertIn("PI_LTC_STOP_AFTER_COMPLETE_PASSES=0", checkpoint_sweeper)
+        self.assertIn("8.0", checkpoint_sweeper)
         self.assertIn("vanilla_stepmatched", launcher)
         self.assertIn("vanilla_stepmatched", evaluator)
         self.assertIn("planner_validation_history.json", evaluator)

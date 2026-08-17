@@ -166,6 +166,11 @@ def main(args, resume_preempt=False):
     canary_optimizer_steps = int(cfgs_meta.get("canary_optimizer_steps", 0) or 0)
     if canary_optimizer_steps < 0:
         raise ValueError("meta.canary_optimizer_steps must be non-negative")
+    planner_scale_sweep_only = bool(
+        cfgs_meta.get("planner_scale_sweep_only", False)
+    )
+    planner_scale_sweep_source_audit = None
+    planner_scale_sweep_expected_metadata = None
     stop_after_complete_passes = int(
         os.environ.get("PI_LTC_STOP_AFTER_COMPLETE_PASSES", "0") or 0
     )
@@ -173,6 +178,83 @@ def main(args, resume_preempt=False):
         raise ValueError(
             "PI_LTC_STOP_AFTER_COMPLETE_PASSES must be non-negative"
         )
+    if planner_scale_sweep_only:
+        if canary_optimizer_steps:
+            raise ValueError(
+                "planner_scale_sweep_only cannot be combined with canary training"
+            )
+        if stop_after_complete_passes:
+            raise ValueError(
+                "planner_scale_sweep_only requires "
+                "PI_LTC_STOP_AFTER_COMPLETE_PASSES=0"
+            )
+        if any(
+            bool(value)
+            for value in (
+                plan_only_eval_mode,
+                unroll_decode_eval_only_mode,
+                light_eval_only_mode,
+            )
+        ):
+            raise ValueError(
+                "planner_scale_sweep_only cannot be combined with another "
+                "evaluation-only mode"
+            )
+        if not load_model or not pretrained_path:
+            raise ValueError(
+                "planner_scale_sweep_only requires meta.load_checkpoint=true "
+                "and an explicit meta.pretrained_path"
+            )
+        if load_opt_scale_epoch:
+            raise ValueError(
+                "planner_scale_sweep_only must not load optimizer/scheduler state"
+            )
+        checkpoint_path = Path(pretrained_path).resolve()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(checkpoint_path)
+        expected_checkpoint_sha256 = str(
+            cfgs_meta.get("planner_scale_sweep_checkpoint_sha256", "")
+        ).lower()
+        if len(expected_checkpoint_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in expected_checkpoint_sha256
+        ):
+            raise ValueError(
+                "planner_scale_sweep_only requires a lowercase 64-character "
+                "meta.planner_scale_sweep_checkpoint_sha256"
+            )
+        actual_checkpoint_sha256 = _sha256_file(checkpoint_path)
+        if actual_checkpoint_sha256 != expected_checkpoint_sha256:
+            raise RuntimeError("planner scale-sweep checkpoint SHA-256 differs")
+        expected_checkpoint_role = str(
+            cfgs_meta.get("planner_scale_sweep_expected_checkpoint_role", "")
+        )
+        expected_checkpoint_steps = int(
+            cfgs_meta.get("planner_scale_sweep_expected_optimizer_steps", -1)
+        )
+        expected_training_complete = cfgs_meta.get(
+            "planner_scale_sweep_expected_training_complete"
+        )
+        if not expected_checkpoint_role or expected_checkpoint_steps < 0:
+            raise ValueError(
+                "planner_scale_sweep_only requires expected checkpoint role "
+                "and non-negative optimizer-step metadata"
+            )
+        if not isinstance(expected_training_complete, bool):
+            raise ValueError(
+                "planner_scale_sweep_expected_training_complete must be boolean"
+            )
+        planner_scale_sweep_expected_metadata = {
+            "checkpoint_role": expected_checkpoint_role,
+            "total_optimizer_steps": expected_checkpoint_steps,
+            "training_complete": expected_training_complete,
+        }
+        planner_scale_sweep_source_audit = {
+            "path": str(checkpoint_path),
+            "bytes": checkpoint_path.stat().st_size,
+            "sha256": actual_checkpoint_sha256,
+            **planner_scale_sweep_expected_metadata,
+        }
     which_dtype = cfgs_meta.get("dtype")
     logger.info(f"⚙️  Using dtype: {which_dtype}")
     if which_dtype.lower() == "bfloat16":
@@ -280,6 +362,10 @@ def main(args, resume_preempt=False):
     train_heads = cfgs_opt["train_heads"]
     cfgs_planner_identified = args.get("planner_identified", {})
     planner_identified_enabled = bool(cfgs_planner_identified.get("enabled", False))
+    if planner_scale_sweep_only and not planner_identified_enabled:
+        raise ValueError(
+            "planner_scale_sweep_only requires planner-identified calibration"
+        )
 
     training_provenance = None
     if strict_provenance:
@@ -365,6 +451,10 @@ def main(args, resume_preempt=False):
     tag = cfgs_logging.get("write_tag", "jepa")
     latest_format = cfgs_logging.get("latest_format", "pth.tar")
     cfgs_wandb = cfgs_logging.get("wandb")
+    if planner_scale_sweep_only and bool(cfgs_wandb.get("use_wandb", False)):
+        raise ValueError(
+            "planner_scale_sweep_only requires logging.wandb.use_wandb=false"
+        )
 
     if light_eval_only_mode:
         light_eval_freq = 1
@@ -421,6 +511,15 @@ def main(args, resume_preempt=False):
         if load_path is None or not os.path.exists(load_path):
             load_path = None
             load_model = False
+    if planner_scale_sweep_only:
+        if not load_model or load_path is None:
+            raise RuntimeError("planner scale-sweep source checkpoint was not resolved")
+        if Path(load_path).resolve() != Path(
+            planner_scale_sweep_source_audit["path"]
+        ).resolve():
+            raise RuntimeError(
+                "planner scale sweep must load the explicitly audited checkpoint"
+            )
 
     train_csv_logger, eval_csv_logger = None, None
 
@@ -612,27 +711,40 @@ def main(args, resume_preempt=False):
         f"optimizer_step_budget={optimizer_step_budget}"
     )
     logger.info(f"📊 Iterations per epoch: {ipe} (dataset size: {_dlen})")
-    canary_scale_sweep_values = ()
-    if canary_optimizer_steps:
+    planner_scale_sweep_values = ()
+    if canary_optimizer_steps or planner_scale_sweep_only:
         if not planner_identified_enabled:
-            raise ValueError("canary_optimizer_steps requires planner-identified training")
+            raise ValueError(
+                "planner scale sweep requires planner-identified calibration"
+            )
+        planner_scale_sweep_values = normalize_scale_sweep_values(
+            cfgs_planner_identified.get(
+                "scale_sweep_values",
+                cfgs_planner_identified.get(
+                    "canary_scale_sweep_values",
+                    [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+                ),
+            )
+        )
+        require_deterministic_scale_sweep_augmentation(cfgs_data_aug)
+    if canary_optimizer_steps:
         if canary_optimizer_steps >= optimizer_steps_per_epoch:
             raise ValueError(
                 "canary_optimizer_steps must be shorter than one physical pass: "
                 f"requested={canary_optimizer_steps}, pass={optimizer_steps_per_epoch}"
             )
-        canary_scale_sweep_values = normalize_scale_sweep_values(
-            cfgs_planner_identified.get(
-                "canary_scale_sweep_values",
-                [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
-            )
-        )
-        require_deterministic_scale_sweep_augmentation(cfgs_data_aug)
         logger.info(
             "PI canary enabled: "
             f"optimizer_steps={canary_optimizer_steps}, "
             f"microbatches={canary_optimizer_steps * gradient_accumulation_steps}, "
-            f"fixed_scale_sweep={list(canary_scale_sweep_values)}"
+            f"fixed_scale_sweep={list(planner_scale_sweep_values)}"
+        )
+    elif planner_scale_sweep_only:
+        logger.info(
+            "Planner checkpoint-only scale sweep enabled: "
+            f"source={planner_scale_sweep_source_audit['path']}, "
+            f"fixed_scale_sweep={list(planner_scale_sweep_values)}, "
+            "optimizer_steps=0"
         )
     if main_optimizer == "transition_model":
         cfgs_opt["transition_model"]["iterations_per_epoch"] = optimizer_steps_per_epoch
@@ -1097,6 +1209,12 @@ def main(args, resume_preempt=False):
             expected_common_trainable_initialization_sha256=(
                 common_trainable_initialization_sha256
             ),
+            expected_checkpoint_metadata=(
+                planner_scale_sweep_expected_metadata
+                if planner_scale_sweep_only
+                else None
+            ),
+            strict_model_state=planner_scale_sweep_only,
         )
         # Only resume the schedulers if we resume a pretraining or a finetuning
         # Not if we start a finetuning: we reset them
@@ -1218,8 +1336,14 @@ def main(args, resume_preempt=False):
     else:
         planner_last_stats = {}
 
-    # -- Initialize LPIPS once for evaluation
-    lpips = lpips_lib.LPIPS(net="vgg").eval().to(device)
+    # -- Initialize LPIPS once for ordinary training/evaluation.  A planner
+    # checkpoint-only scale sweep never decodes pixels and must not initialize
+    # an unrelated perceptual model.
+    lpips = (
+        None
+        if planner_scale_sweep_only
+        else lpips_lib.LPIPS(net="vgg").eval().to(device)
+    )
 
     def save_checkpoint(
         epoch,
@@ -1283,8 +1407,14 @@ def main(args, resume_preempt=False):
             raise
 
     logger.info("Initializing loader...")
-    train_loader = iter(unsupervised_loader)
-    planner_loader_iter = iter(planner_loader) if planner_loader is not None else None
+    train_loader = (
+        None if planner_scale_sweep_only else iter(unsupervised_loader)
+    )
+    planner_loader_iter = (
+        None
+        if planner_scale_sweep_only or planner_loader is None
+        else iter(planner_loader)
+    )
     if val_data_iters != [(None, None, None)]:
         val_loader_iters = []
         for vl_dset, vl_traj_dset, vl_loader in val_data_iters:
@@ -1447,23 +1577,25 @@ def main(args, resume_preempt=False):
             raise RuntimeError("planner held-out evaluation produced a non-finite metric")
         return metrics
 
-    def evaluate_canary_scale_sweep(learned_metrics):
+    def evaluate_planner_scale_sweep(learned_metrics):
         """Evaluate fixed scales without mutating the learned checkpoint state."""
 
-        if not canary_scale_sweep_values:
-            raise RuntimeError("canary scale sweep has no configured interventions")
+        if not planner_scale_sweep_values:
+            raise RuntimeError("planner scale sweep has no configured interventions")
         scale_module = planner_input_scale(world_model)
         if scale_module.runtime_override is not None:
-            raise RuntimeError("canary scale sweep requires no pre-existing runtime override")
+            raise RuntimeError(
+                "planner scale sweep requires no pre-existing runtime override"
+            )
         checkpoint_log_scale_before = float(scale_module.log_scale.detach().cpu())
         checkpoint_learned_scale = float(scale_module.input_scale.detach().cpu())
         fixed_metrics = []
         try:
-            for fixed_scale in canary_scale_sweep_values:
+            for fixed_scale in planner_scale_sweep_values:
                 scale_module.set_runtime_override(fixed_scale)
                 if rank == 0:
                     logger.info(
-                        "[CANARY SCALE SWEEP] "
+                        "[PLANNER SCALE SWEEP] "
                         f"fixed_scale={fixed_scale:.9g}"
                     )
                 fixed_metrics.append(
@@ -1473,7 +1605,9 @@ def main(args, resume_preempt=False):
             scale_module.clear_runtime_override()
         checkpoint_log_scale_after = float(scale_module.log_scale.detach().cpu())
         if checkpoint_log_scale_after != checkpoint_log_scale_before:
-            raise RuntimeError("canary scale sweep mutated the learned scale parameter")
+            raise RuntimeError(
+                "planner scale sweep mutated the learned scale parameter"
+            )
         diagnostic = build_scale_sweep_diagnostic(
             learned_scale=checkpoint_learned_scale,
             learned_metrics=learned_metrics,
@@ -1627,7 +1761,51 @@ def main(args, resume_preempt=False):
             return all_clips, None, None, None, all_masks_enc, all_masks_pred
 
     # -- TRAINING LOOP
-    if not (plan_only_eval_mode or unroll_decode_eval_only_mode):
+    if planner_scale_sweep_only:
+        logger.info(
+            "[PLANNER SCALE SWEEP ONLY] evaluating one frozen checkpoint; "
+            "no training batches or optimizer steps will run"
+        )
+        learned_metrics = evaluate_planner_validation()
+        scale_sweep = evaluate_planner_scale_sweep(learned_metrics)
+        if rank == 0:
+            evaluator_commit = (
+                training_provenance.get("repository_commit")
+                if training_provenance is not None
+                else None
+            )
+            artifact = {
+                "schema_version": 1,
+                "status": "PLANNER_SCALE_SWEEP_ONLY_COMPLETE",
+                "protocol": "frozen-checkpoint-extended-scale-sweep-v1",
+                "evaluation_repository_commit": evaluator_commit,
+                "source_checkpoint": planner_scale_sweep_source_audit,
+                "optimizer_steps_executed": 0,
+                "microbatches_consumed": 0,
+                "model_parameters_updated": False,
+                "heldout_group_ids_sha256": (
+                    planner_validation_group_ids_sha256
+                ),
+                "planner_scale_sweep": scale_sweep,
+            }
+            output_path = Path(folder) / "planner_scale_sweep_only.json"
+            temporary_path = output_path.with_suffix(".json.tmp")
+            temporary_path.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temporary_path.replace(output_path)
+            best = scale_sweep["best_observed"]
+            logger.info(
+                "[PLANNER SCALE SWEEP ONLY COMPLETE] "
+                f"best_mode={best['mode']} best_scale={best['scale']:.9g} "
+                f"best_loss={best['planner_landscape_loss']:.9g} "
+                f"artifact={output_path}"
+            )
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        return
+    elif not (plan_only_eval_mode or unroll_decode_eval_only_mode):
         canary_complete = False
         step_budget_complete = False
         planner_initial_validation_metrics = None
@@ -2522,7 +2700,7 @@ def main(args, resume_preempt=False):
                 )
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
-                scale_sweep = evaluate_canary_scale_sweep(
+                scale_sweep = evaluate_planner_scale_sweep(
                     planner_validation_metrics
                 )
                 if rank == 0:

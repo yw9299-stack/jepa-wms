@@ -86,6 +86,27 @@ interventions and verifies that the learned checkpoint parameter was unchanged.
 This diagnostic never changes the pass/fail gate: a rejected canary remains
 ineligible for formal training and checkpoint selection.
 
+If the best fixed intervention lands at the canary grid boundary, do not rerun
+the 2,000 optimizer updates.  The rejected canary checkpoint can be loaded in
+strict, checkpoint-only mode and evaluated on the same deterministic held-out
+split with the extended grid
+`[1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 3, 3.5, 4, 5, 6, 8]`:
+
+```bash
+PI_LTC_EXPECTED_COMMIT=<full detached evaluator commit> \
+  bash scripts/pusht_canary_extended_scale_sweep_autodl.sh
+```
+
+The launcher validates the saved checkpoint SHA-256, requires
+`checkpoint_role=canary_diagnostic`, `total_optimizer_steps=2000`, and
+`training_complete=false`, and requires an exact model-state load.  It hashes
+the checkpoint but only locates and byte-size-checks the two large HDF5 files.
+W&B is disabled, zero training microbatches and optimizer steps are consumed,
+and the immutable result is written to
+`extended_scale_sweep_<commit>/planner_scale_sweep_only.json`.  This artifact
+is diagnostic only and cannot make a rejected canary eligible for formal
+training.
+
 The first v5 PushT canary was rejected by that gate and remains an immutable
 diagnostic artifact.  The diagnostic-checkpoint/sweep revision therefore uses
 fresh `v6` run directories so config manifests and rejected v5 outputs are
