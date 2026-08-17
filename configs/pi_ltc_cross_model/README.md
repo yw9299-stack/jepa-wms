@@ -28,7 +28,7 @@ is detached. The planner-landscape objective updates only
 `log_input_scale`. The frozen DINOv2 encoder receives no gradient from either
 objective.
 
-## v5 history-aligned adaptation
+## v5/v6 history-aligned adaptation
 
 The v5 PushT/Cube protocol fixes an implementation mismatch in the earlier v4
 transfer runs.  The transition model is trained with three context frames, so
@@ -60,9 +60,9 @@ loss and its optimization protocol:
   drift instead of clamping the model.
 
 The v4 checkpoints remain immutable historical artifacts and must not be
-resumed into v5: the optimizer state has a different parameter-group layout.
-Start v5 from the same canonical public initialization.  A recommended first
-launch is a 2,000-update PI canary:
+resumed into v5/v6: the optimizer state has a different parameter-group layout.
+Start v5/v6 from the same canonical public initialization.  A recommended
+first launch is a 2,000-update PI canary:
 
 ```bash
 NO_FILE_SCAN=1 PREFLIGHT_ONLY=0 CANARY_OPTIMIZER_STEPS=2000 \
@@ -76,6 +76,21 @@ and Cube to four.  No relay process or termination signal is required.  To
 extend both PushT arms from their saved pass-1 checkpoints through pass 2, run
 the same commands with `TARGET_COMPLETE_PASSES=2`; strict resume retains the
 configured long-horizon scheduler and all optimizer state.
+
+Every canary, including a rejected one, now preserves
+`jepa-canary-stepN.pth.tar` with `checkpoint_role=canary_diagnostic`.  It also
+evaluates the frozen final model with learned scale and fixed scales
+`[0.25, 0.5, 0.75, 1, 1.25, 1.5, 2]` over the exact same held-out groups.
+`canary_scale_sweep.json` records the learned, identity, and best observed
+interventions and verifies that the learned checkpoint parameter was unchanged.
+This diagnostic never changes the pass/fail gate: a rejected canary remains
+ineligible for formal training and checkpoint selection.
+
+The first v5 PushT canary was rejected by that gate and remains an immutable
+diagnostic artifact.  The diagnostic-checkpoint/sweep revision therefore uses
+fresh `v6` run directories so config manifests and rejected v5 outputs are
+never overwritten.  v6 does not change the v5 architecture, objective, data,
+optimizer, or gate.
 
 ```bash
 NO_FILE_SCAN=1 PREFLIGHT_ONLY=0 TARGET_COMPLETE_PASSES=1 \

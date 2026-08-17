@@ -56,6 +56,11 @@ from app.vjepa_wm.planner_landscape import (
     planner_input_scale,
     planner_landscape_result,
 )
+from app.vjepa_wm.planner_scale_diagnostics import (
+    build_scale_sweep_diagnostic,
+    normalize_scale_sweep_values,
+    require_deterministic_scale_sweep_augmentation,
+)
 from app.vjepa_wm.utils import (
     build_plan_eval_args,
     build_unroll_decode_eval_args,
@@ -87,6 +92,14 @@ torch.backends.cudnn.benchmark = True
 
 
 logger = get_logger(__name__)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _common_trainable_initialization_sha256(
@@ -599,6 +612,7 @@ def main(args, resume_preempt=False):
         f"optimizer_step_budget={optimizer_step_budget}"
     )
     logger.info(f"📊 Iterations per epoch: {ipe} (dataset size: {_dlen})")
+    canary_scale_sweep_values = ()
     if canary_optimizer_steps:
         if not planner_identified_enabled:
             raise ValueError("canary_optimizer_steps requires planner-identified training")
@@ -607,10 +621,18 @@ def main(args, resume_preempt=False):
                 "canary_optimizer_steps must be shorter than one physical pass: "
                 f"requested={canary_optimizer_steps}, pass={optimizer_steps_per_epoch}"
             )
+        canary_scale_sweep_values = normalize_scale_sweep_values(
+            cfgs_planner_identified.get(
+                "canary_scale_sweep_values",
+                [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+            )
+        )
+        require_deterministic_scale_sweep_augmentation(cfgs_data_aug)
         logger.info(
             "PI canary enabled: "
             f"optimizer_steps={canary_optimizer_steps}, "
-            f"microbatches={canary_optimizer_steps * gradient_accumulation_steps}"
+            f"microbatches={canary_optimizer_steps * gradient_accumulation_steps}, "
+            f"fixed_scale_sweep={list(canary_scale_sweep_values)}"
         )
     if main_optimizer == "transition_model":
         cfgs_opt["transition_model"]["iterations_per_epoch"] = optimizer_steps_per_epoch
@@ -624,6 +646,7 @@ def main(args, resume_preempt=False):
     planner_validation_groups = None
     planner_validation_loader = None
     planner_validation_sampler = None
+    planner_validation_group_ids_sha256 = None
     if planner_identified_enabled:
         if dataset_type != "stablewm_h5":
             raise ValueError("planner-identified cross-model training requires dataset_type=stablewm_h5")
@@ -668,6 +691,15 @@ def main(args, resume_preempt=False):
             planner_dataset,
             traj_dataset.train_episode_ids,
         )
+        planner_validation_group_ids = np.asarray(
+            planner_dataset.group_indices[
+                np.asarray(planner_validation_groups.indices, dtype=np.int64)
+            ],
+            dtype="<i8",
+        )
+        planner_validation_group_ids_sha256 = hashlib.sha256(
+            planner_validation_group_ids.tobytes()
+        ).hexdigest()
         planner_sampler = DistributedSampler(
             planner_training_groups,
             num_replicas=world_size,
@@ -1198,6 +1230,7 @@ def main(args, resume_preempt=False):
         training_complete=False,
         planner_validation_metrics=None,
         planner_selection=None,
+        checkpoint_role="training",
     ):
         if rank != 0:
             return
@@ -1215,6 +1248,7 @@ def main(args, resume_preempt=False):
             "optimizer_step_in_epoch": int(optimizer_step_in_epoch),
             "optimizer_step_budget": optimizer_step_budget,
             "training_complete": bool(training_complete),
+            "checkpoint_role": str(checkpoint_role),
             "requested_stop_after_complete_passes": (
                 stop_after_complete_passes
             ),
@@ -1412,6 +1446,53 @@ def main(args, resume_preempt=False):
         if not all(np.isfinite(value) for value in metrics.values()):
             raise RuntimeError("planner held-out evaluation produced a non-finite metric")
         return metrics
+
+    def evaluate_canary_scale_sweep(learned_metrics):
+        """Evaluate fixed scales without mutating the learned checkpoint state."""
+
+        if not canary_scale_sweep_values:
+            raise RuntimeError("canary scale sweep has no configured interventions")
+        scale_module = planner_input_scale(world_model)
+        if scale_module.runtime_override is not None:
+            raise RuntimeError("canary scale sweep requires no pre-existing runtime override")
+        checkpoint_log_scale_before = float(scale_module.log_scale.detach().cpu())
+        checkpoint_learned_scale = float(scale_module.input_scale.detach().cpu())
+        fixed_metrics = []
+        try:
+            for fixed_scale in canary_scale_sweep_values:
+                scale_module.set_runtime_override(fixed_scale)
+                if rank == 0:
+                    logger.info(
+                        "[CANARY SCALE SWEEP] "
+                        f"fixed_scale={fixed_scale:.9g}"
+                    )
+                fixed_metrics.append(
+                    (fixed_scale, evaluate_planner_validation())
+                )
+        finally:
+            scale_module.clear_runtime_override()
+        checkpoint_log_scale_after = float(scale_module.log_scale.detach().cpu())
+        if checkpoint_log_scale_after != checkpoint_log_scale_before:
+            raise RuntimeError("canary scale sweep mutated the learned scale parameter")
+        diagnostic = build_scale_sweep_diagnostic(
+            learned_scale=checkpoint_learned_scale,
+            learned_metrics=learned_metrics,
+            fixed_metrics=fixed_metrics,
+        )
+        diagnostic.update(
+            {
+                "checkpoint_log_scale_before_sweep": checkpoint_log_scale_before,
+                "checkpoint_log_scale_after_sweep": checkpoint_log_scale_after,
+                "learned_parameter_unchanged": True,
+                "heldout_group_count": int(
+                    learned_metrics["planner_group_count"]
+                ),
+                "heldout_group_ids_sha256": (
+                    planner_validation_group_ids_sha256
+                ),
+            }
+        )
+        return diagnostic
 
     def persist_planner_validation(
         metrics,
@@ -2378,40 +2459,107 @@ def main(args, resume_preempt=False):
             )
 
             if canary_complete:
+                scale = planner_input_scale(world_model)
+                log_scale_drift_per_1000_steps = (
+                    (
+                        planner_validation_metrics["planner_log_scale"]
+                        - planner_initial_validation_metrics["planner_log_scale"]
+                    )
+                    * 1000.0
+                    / canary_optimizer_steps
+                )
+                max_canary_drift = cfgs_planner_identified.get(
+                    "canary_max_abs_log_scale_drift_per_1000_steps"
+                )
+                canary_drift_passed = (
+                    max_canary_drift is None
+                    or abs(log_scale_drift_per_1000_steps)
+                    <= float(max_canary_drift)
+                )
+                require_non_degradation = bool(
+                    cfgs_planner_identified.get(
+                        "canary_require_heldout_non_degradation",
+                        False,
+                    )
+                )
+                canary_validation_passed = (
+                    not require_non_degradation
+                    or planner_validation_metrics["planner_landscape_loss"]
+                    <= planner_initial_validation_metrics[
+                        "planner_landscape_loss"
+                    ]
+                )
+                canary_gate_passed = (
+                    canary_drift_passed and canary_validation_passed
+                )
+
+                canary_checkpoint_path = os.path.join(
+                    checkpoint_folder,
+                    pref_tag
+                    + f"canary-step{canary_optimizer_steps}.{latest_format}",
+                )
+                save_checkpoint(
+                    canary_optimizer_steps // optimizer_steps_per_epoch,
+                    canary_checkpoint_path,
+                    total_optimizer_step_count=canary_optimizer_steps,
+                    optimizer_step_in_epoch=(
+                        canary_optimizer_steps % optimizer_steps_per_epoch
+                    ),
+                    training_complete=False,
+                    planner_validation_metrics=planner_validation_metrics,
+                    planner_selection={
+                        "criterion": (
+                            "diagnostic canary only; never eligible for final "
+                            "checkpoint selection"
+                        ),
+                        "total_optimizer_steps": canary_optimizer_steps,
+                        "completed_physical_passes": (
+                            canary_optimizer_steps // optimizer_steps_per_epoch
+                        ),
+                        "eligible_for_selection": False,
+                    },
+                    checkpoint_role="canary_diagnostic",
+                )
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+                scale_sweep = evaluate_canary_scale_sweep(
+                    planner_validation_metrics
+                )
                 if rank == 0:
-                    scale = planner_input_scale(world_model)
-                    log_scale_drift_per_1000_steps = (
-                        (
-                            planner_validation_metrics["planner_log_scale"]
-                            - planner_initial_validation_metrics["planner_log_scale"]
-                        )
-                        * 1000.0
-                        / canary_optimizer_steps
+                    checkpoint_path = Path(canary_checkpoint_path).resolve()
+                    checkpoint_audit = {
+                        "path": str(checkpoint_path),
+                        "bytes": checkpoint_path.stat().st_size,
+                        "sha256": _sha256_file(checkpoint_path),
+                        "checkpoint_role": "canary_diagnostic",
+                        "total_optimizer_steps": canary_optimizer_steps,
+                        "completed_physical_passes": (
+                            canary_optimizer_steps // optimizer_steps_per_epoch
+                        ),
+                        "optimizer_step_in_pass": (
+                            canary_optimizer_steps % optimizer_steps_per_epoch
+                        ),
+                        "training_complete": False,
+                    }
+                    scale_sweep.update(
+                        {
+                            "checkpoint": checkpoint_audit,
+                            "repository_commit": (
+                                training_provenance.get("repository_commit")
+                                if training_provenance is not None
+                                else None
+                            ),
+                        }
                     )
-                    max_canary_drift = cfgs_planner_identified.get(
-                        "canary_max_abs_log_scale_drift_per_1000_steps"
+                    scale_sweep_path = Path(folder) / "canary_scale_sweep.json"
+                    temporary_scale_sweep_path = scale_sweep_path.with_suffix(
+                        ".json.tmp"
                     )
-                    canary_drift_passed = (
-                        max_canary_drift is None
-                        or abs(log_scale_drift_per_1000_steps)
-                        <= float(max_canary_drift)
+                    temporary_scale_sweep_path.write_text(
+                        json.dumps(scale_sweep, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
                     )
-                    require_non_degradation = bool(
-                        cfgs_planner_identified.get(
-                            "canary_require_heldout_non_degradation",
-                            False,
-                        )
-                    )
-                    canary_validation_passed = (
-                        not require_non_degradation
-                        or planner_validation_metrics["planner_landscape_loss"]
-                        <= planner_initial_validation_metrics[
-                            "planner_landscape_loss"
-                        ]
-                    )
-                    canary_gate_passed = (
-                        canary_drift_passed and canary_validation_passed
-                    )
+                    temporary_scale_sweep_path.replace(scale_sweep_path)
                     summary = {
                         "status": (
                             "CANARY_COMPLETE"
@@ -2455,6 +2603,11 @@ def main(args, resume_preempt=False):
                         "final_scale": float(scale.input_scale.detach().cpu()),
                         "heldout_initial": planner_initial_validation_metrics,
                         "heldout_final": planner_validation_metrics,
+                        "canary_checkpoint": checkpoint_audit,
+                        "canary_scale_sweep_path": str(
+                            scale_sweep_path.resolve()
+                        ),
+                        "canary_scale_sweep": scale_sweep,
                         "log_scale_drift_per_1000_optimizer_steps": (
                             log_scale_drift_per_1000_steps
                         ),
@@ -2507,8 +2660,12 @@ def main(args, resume_preempt=False):
                     )
                     temporary_path.replace(summary_path)
                     logger.info(
-                        f"[{summary['status']}] summary={summary_path}"
+                        f"[{summary['status']}] summary={summary_path} "
+                        f"checkpoint={checkpoint_path} "
+                        f"scale_sweep={scale_sweep_path}"
                     )
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
                 break
 
             if step_budget_complete:

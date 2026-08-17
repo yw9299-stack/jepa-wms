@@ -66,6 +66,10 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
                 self.assertTrue(
                     pi["planner_identified"]["validation_at_start"]
                 )
+                self.assertEqual(
+                    pi["planner_identified"]["canary_scale_sweep_values"],
+                    [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+                )
 
     def test_vanilla_restores_exact_pi_config(self):
         for task in TASKS:
@@ -123,7 +127,7 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
                     f"step{expected[task]['steps']}",
                     spec["pi_run"],
                 )
-                self.assertIn("_v5_", spec["pi_run"])
+                self.assertIn("_v6_", spec["pi_run"])
                 full_passes, tail_steps = divmod(
                     expected[task]["steps"],
                     expected[task]["steps_per_pass"],
@@ -154,6 +158,7 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
 
     def test_launch_and_evaluation_names_are_step_matched(self):
         launcher = Path("scripts/stablewm_task_5pass_autodl.sh").read_text()
+        trainer = Path("app/vjepa_wm/train.py").read_text(encoding="utf-8")
         evaluator = Path("scripts/stablewm_task_eval_autodl.sh").read_text()
         evaluator_protocol = Path(
             "scripts/eval_stablewm_task_protocol.py"
@@ -167,6 +172,11 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
         self.assertIn("DEFAULT_TARGET_COMPLETE_PASSES=4", launcher)
         self.assertIn("PI_LTC_STOP_AFTER_COMPLETE_PASSES", launcher)
         self.assertIn("not_scanned_user_confirmed", launcher)
+        self.assertIn("[canary diagnostic]", launcher)
+        self.assertIn("canary diagnostic checkpoint audit is missing", launcher)
+        self.assertIn("checkpoint_role=\"canary_diagnostic\"", trainer)
+        self.assertIn("canary_scale_sweep.json", trainer)
+        self.assertIn("evaluate_canary_scale_sweep", trainer)
         self.assertIn("vanilla_stepmatched", launcher)
         self.assertIn("vanilla_stepmatched", evaluator)
         self.assertIn("planner_validation_history.json", evaluator)
@@ -174,6 +184,11 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
         self.assertIn("AUDITED_HASHES", evaluator)
         self.assertIn("heldout_complete_pass_v1", evaluator_protocol)
         self.assertIn('"vanilla_stepmatched": "vanilla"', summary)
+        for spec in TASKS.values():
+            self.assertIn(spec["pi_run"], launcher)
+            self.assertIn(spec["vanilla_run"], launcher)
+            self.assertIn(spec["pi_run"], evaluator)
+            self.assertIn(spec["vanilla_run"], evaluator)
 
 
 if __name__ == "__main__":

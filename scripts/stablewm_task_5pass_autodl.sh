@@ -51,8 +51,8 @@ if [ "$TASK" = pusht ]; then
   SIDECAR="$PI_LTC_PUSHT_SIDECAR"
   EXPECTED_SOURCE_BYTES=46300921856
   EXPECTED_SIDECAR_BYTES=192116437
-  PI_RUN="pusht_jepa_wm_pi_ltc_step111464_v5_seed3072"
-  VANILLA_RUN="pusht_jepa_wm_vanilla_step111464_v5_seed3072"
+  PI_RUN="pusht_jepa_wm_pi_ltc_step111464_v6_seed3072"
+  VANILLA_RUN="pusht_jepa_wm_vanilla_step111464_v6_seed3072"
   OPTIMIZER_STEP_BUDGET=111464
   LEWM_REFERENCE_PASSES=8
   DRIVER_EPOCHS=9
@@ -64,8 +64,8 @@ else
   SIDECAR="$PI_LTC_CUBE_SIDECAR"
   EXPECTED_SOURCE_BYTES=101942558720
   EXPECTED_SIDECAR_BYTES=1282198884
-  PI_RUN="cube_jepa_wm_pi_ltc_step51184_v5_seed3072"
-  VANILLA_RUN="cube_jepa_wm_vanilla_step51184_v5_seed3072"
+  PI_RUN="cube_jepa_wm_pi_ltc_step51184_v6_seed3072"
+  VANILLA_RUN="cube_jepa_wm_vanilla_step51184_v6_seed3072"
   OPTIMIZER_STEP_BUDGET=51184
   LEWM_REFERENCE_PASSES=4
   DRIVER_EPOCHS=4
@@ -357,7 +357,30 @@ PY
   python - "$CANARY_DIR/canary_summary.json" <<'PY' || fail "canary safety gate rejected this configuration"
 import json
 import sys
+from pathlib import Path
+
 summary = json.load(open(sys.argv[1], encoding="utf-8"))
+checkpoint = summary.get("canary_checkpoint") or {}
+sweep = summary.get("canary_scale_sweep") or {}
+if checkpoint.get("checkpoint_role") != "canary_diagnostic":
+    raise SystemExit("[STOP] canary diagnostic checkpoint audit is missing")
+if not Path(checkpoint.get("path", "")).is_file():
+    raise SystemExit("[STOP] canary diagnostic checkpoint file is missing")
+if sweep.get("status") != "complete" or sweep.get("learned_parameter_unchanged") is not True:
+    raise SystemExit("[STOP] canary fixed-scale sweep is incomplete")
+if not Path(summary.get("canary_scale_sweep_path", "")).is_file():
+    raise SystemExit("[STOP] canary fixed-scale sweep artifact is missing")
+learned = sweep["learned"]
+identity = sweep["identity"]
+best = sweep["best_observed"]
+print(
+    "[canary diagnostic] "
+    f"gate={summary.get('canary_gate_passed')} "
+    f"learned=({learned['scale']:.6g}, loss={learned['planner_landscape_loss']:.6g}) "
+    f"identity_loss={identity['planner_landscape_loss']:.6g} "
+    f"best=({best['mode']}, scale={best['scale']:.6g}, "
+    f"loss={best['planner_landscape_loss']:.6g})"
+)
 raise SystemExit(0 if summary.get("canary_gate_passed") is True else 1)
 PY
   echo "[canary complete] summary=$CANARY_DIR/canary_summary.json"
