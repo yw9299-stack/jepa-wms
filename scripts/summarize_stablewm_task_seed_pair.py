@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize one clean paired PI-versus-vanilla StableWM evaluation seed."""
+"""Summarize one clean, pass-matched PI-versus-vanilla evaluation seed."""
 
 from __future__ import annotations
 
@@ -41,9 +41,11 @@ def summarize(
     task: str,
     seed: int,
     *,
+    expected_completed_passes: int,
     bootstrap_draws: int,
     bootstrap_seed: int,
 ) -> dict:
+    require(expected_completed_passes > 0, "expected completed passes must be positive")
     audits = {}
     for arm, owner in (("learned", "pi"), ("vanilla_stepmatched", "vanilla")):
         path = input_root / task / f"seed{seed}" / arm / "arm_audit.json"
@@ -61,8 +63,21 @@ def summarize(
         require(
             checkpoint.get("selection_policy") == "native_complete_pass_boundary", f"{path}: wrong checkpoint policy"
         )
-        require(checkpoint.get("selected_completed_passes") == 1, f"{path}: not pass 1")
-        require(checkpoint.get("total_optimizer_steps") == 13923, f"{path}: optimizer steps differ")
+        require(
+            checkpoint.get("selected_completed_passes") == expected_completed_passes,
+            f"{path}: not pass {expected_completed_passes}",
+        )
+        optimizer_steps_per_pass = checkpoint.get("optimizer_steps_per_epoch")
+        require(
+            isinstance(optimizer_steps_per_pass, int) and optimizer_steps_per_pass > 0,
+            f"{path}: invalid optimizer steps/pass",
+        )
+        require(checkpoint.get("optimizer_step_in_epoch") == 0, f"{path}: not a complete pass boundary")
+        require(
+            checkpoint.get("total_optimizer_steps")
+            == expected_completed_passes * optimizer_steps_per_pass,
+            f"{path}: optimizer steps differ from pass boundary",
+        )
         audits[arm] = audit
 
     pi = audits["learned"]
@@ -93,6 +108,16 @@ def summarize(
     )
     pi_checkpoint = pi["checkpoint"]
     vanilla_checkpoint = vanilla["checkpoint"]
+    require(
+        pi_checkpoint["optimizer_steps_per_epoch"]
+        == vanilla_checkpoint["optimizer_steps_per_epoch"],
+        "PI/vanilla optimizer steps/pass differ",
+    )
+    require(
+        pi_checkpoint["total_optimizer_steps"]
+        == vanilla_checkpoint["total_optimizer_steps"],
+        "PI/vanilla total optimizer steps differ",
+    )
     require(pi_checkpoint.get("sha256") != vanilla_checkpoint.get("sha256"), "PI/vanilla checkpoints are identical")
     require(
         pi_checkpoint.get("common_trainable_initialization_sha256")
@@ -108,13 +133,17 @@ def summarize(
     result = {
         "schema_version": 1,
         "status": "complete",
-        "estimand": "cross-checkpoint matched one-pass PI-LTC versus vanilla",
+        "estimand": (
+            f"cross-checkpoint matched {expected_completed_passes}-pass "
+            "PI-LTC versus vanilla"
+        ),
         "task": task,
         "eval_seed": seed,
         "episodes": 50,
         "action_noise_std": 0.0,
-        "completed_training_passes_per_arm": 1,
-        "optimizer_steps_per_arm": 13923,
+        "completed_training_passes_per_arm": expected_completed_passes,
+        "optimizer_steps_per_pass": pi_checkpoint["optimizer_steps_per_epoch"],
+        "optimizer_steps_per_arm": pi_checkpoint["total_optimizer_steps"],
         "pi_success_rate": float(pi_outcomes.mean() * 100.0),
         "vanilla_success_rate": float(vanilla_outcomes.mean() * 100.0),
         "difference_pp": float((pi_outcomes.mean() - vanilla_outcomes.mean()) * 100.0),
@@ -149,6 +178,7 @@ def main() -> int:
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--task", choices=("pusht", "cube"), required=True)
     parser.add_argument("--eval-seed", type=int, choices=(42, 43, 44), required=True)
+    parser.add_argument("--expected-completed-passes", type=int, choices=(1, 2), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--bootstrap-draws", type=int, default=10000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260816)
@@ -157,6 +187,7 @@ def main() -> int:
         args.input_root.resolve(),
         args.task,
         args.eval_seed,
+        expected_completed_passes=args.expected_completed_passes,
         bootstrap_draws=args.bootstrap_draws,
         bootstrap_seed=args.bootstrap_seed,
     )

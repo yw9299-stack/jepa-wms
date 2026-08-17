@@ -104,6 +104,7 @@ python scripts/summarize_stablewm_task_seed_pair.py \
   --input-root "$OUTPUT_ROOT" \
   --task pusht \
   --eval-seed 42 \
+  --expected-completed-passes 2 \
   --output "$SUMMARY" \
   --bootstrap-draws 10000 \
   --bootstrap-seed 20260817

@@ -92,7 +92,9 @@ class TestSeed42PairSummary(unittest.TestCase):
                     "sha256": checkpoint,
                     "selection_policy": "native_complete_pass_boundary",
                     "selected_completed_passes": 1,
+                    "optimizer_steps_per_epoch": 13923,
                     "total_optimizer_steps": 13923,
+                    "optimizer_step_in_epoch": 0,
                     "common_trainable_initialization_sha256": "a" * 64,
                 },
                 "results": {
@@ -114,6 +116,7 @@ class TestSeed42PairSummary(unittest.TestCase):
             self.root,
             "pusht",
             42,
+            expected_completed_passes=1,
             bootstrap_draws=200,
             bootstrap_seed=7,
         )
@@ -133,16 +136,40 @@ class TestSeed42PairSummary(unittest.TestCase):
                 self.root,
                 "pusht",
                 42,
+                expected_completed_passes=1,
                 bootstrap_draws=20,
                 bootstrap_seed=7,
             )
 
+    def test_pass_two_pair_uses_existing_pass_two_audits(self):
+        for path in self.root.rglob("arm_audit.json"):
+            audit = json.loads(path.read_text(encoding="utf-8"))
+            audit["checkpoint"]["selected_completed_passes"] = 2
+            audit["checkpoint"]["total_optimizer_steps"] = 27846
+            path.write_text(json.dumps(audit), encoding="utf-8")
+
+        result = summarize(
+            self.root,
+            "pusht",
+            42,
+            expected_completed_passes=2,
+            bootstrap_draws=200,
+            bootstrap_seed=7,
+        )
+
+        self.assertEqual(result["completed_training_passes_per_arm"], 2)
+        self.assertEqual(result["optimizer_steps_per_pass"], 13923)
+        self.assertEqual(result["optimizer_steps_per_arm"], 27846)
+        self.assertIn("matched 2-pass", result["estimand"])
+
 
 def test_launcher_runs_only_two_clean_seed42_arms():
     text = Path("scripts/pusht_one_pass_seed42_clean_eval_autodl.sh").read_text(encoding="utf-8")
+    summary_command = text.split("summarize_stablewm_task_seed_pair.py", 1)[1]
     assert "--eval-seed 42" in text
     assert "--episodes 50" in text
     assert "--expected-completed-passes 1" in text
+    assert "--expected-completed-passes 1" in summary_command
     assert "run_arm pi learned" in text
     assert "run_arm vanilla vanilla_stepmatched" in text
     assert "run_arm pi identity" not in text
@@ -153,11 +180,13 @@ def test_launcher_runs_only_two_clean_seed42_arms():
 
 def test_two_pass_launcher_selects_atomic_pass_two_pair():
     text = Path("scripts/pusht_two_pass_seed42_clean_eval_autodl.sh").read_text(encoding="utf-8")
+    summary_command = text.split("summarize_stablewm_task_seed_pair.py", 1)[1]
     assert "pusht_second_pass_relay/relay_summary.json" in text
     assert "pusht_twopass_seed42_clean_v1" in text
     assert "--eval-seed 42" in text
     assert "--episodes 50" in text
     assert "--expected-completed-passes 2" in text
+    assert "--expected-completed-passes 2" in summary_command
     assert "run_arm pi learned" in text
     assert "run_arm vanilla vanilla_stepmatched" in text
     assert "run_arm pi identity" not in text
