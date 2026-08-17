@@ -34,8 +34,8 @@ else
   SOURCE="${PI_LTC_CUBE_SOURCE:-/root/autodl-tmp/lewm_data/ogbench/cube_single_expert.h5}"
   SOURCE_SHA="${PI_LTC_CUBE_SOURCE_SHA256:-}"
   SIDECAR_SHA="${PI_LTC_CUBE_SIDECAR_SHA256:-}"
-  PI_RUN="${PI_RUN:-cube_jepa_wm_pi_ltc_step51184_v6_seed3072}"
-  VANILLA_RUN="${VANILLA_RUN:-cube_jepa_wm_vanilla_step51184_v6_seed3072}"
+  PI_RUN="${PI_RUN:-cube_jepa_wm_pi_ltc_step51184_v7_seed3072}"
+  VANILLA_RUN="${VANILLA_RUN:-cube_jepa_wm_vanilla_step51184_v7_seed3072}"
 fi
 
 PI_DIR="$JEPAWM_LOGS/pi_ltc_cross_model/$PI_RUN"

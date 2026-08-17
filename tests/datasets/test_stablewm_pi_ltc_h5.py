@@ -187,6 +187,7 @@ class TestStableWmPiLtcH5(unittest.TestCase):
         action_dim,
         proprio_columns,
         episode_id_key="episode_idx",
+        terminal_nan_actions=False,
     ):
         path = Path(self.directory.name) / name
         episode_count, episode_length = 4, 30
@@ -208,10 +209,10 @@ class TestStableWmPiLtcH5(unittest.TestCase):
                 "pixels",
                 data=np.zeros((rows, 4, 4, 3), dtype=np.uint8),
             )
-            source.create_dataset(
-                "action",
-                data=np.arange(rows * action_dim, dtype=np.float32).reshape(rows, action_dim),
-            )
+            actions = np.arange(rows * action_dim, dtype=np.float32).reshape(rows, action_dim)
+            if terminal_nan_actions:
+                actions[np.arange(episode_length - 1, rows, episode_length)] = np.nan
+            source.create_dataset("action", data=actions)
             for key, dim, value in proprio_columns:
                 source.create_dataset(
                     key,
@@ -366,6 +367,80 @@ class TestStableWmPiLtcH5(unittest.TestCase):
             planner[0]["context_proprio"].numpy(),
             np.repeat(merged[None], 3, axis=0),
         )
+
+    def test_cube_terminal_action_placeholders_match_native_lewm(self):
+        source_path = self._write_episode_level_source(
+            "cube_terminal_nan.h5",
+            action_dim=5,
+            episode_id_key="ep_idx",
+            proprio_columns=(("proprio", 4, 1.0),),
+            terminal_nan_actions=True,
+        )
+        datasets, metadata_by_split, _ = load_stablewm_h5_train_val(
+            source_path,
+            transform=None,
+            normalize_action=True,
+            split_ratio=0.5,
+            num_hist=3,
+            num_pred=1,
+            num_frames_val=4,
+            frameskip=5,
+            action_skip=1,
+            random_seed=7,
+            proprio_keys=("proprio",),
+            expected_action_dim=5,
+            expected_proprio_dim=4,
+            expected_row_count=120,
+            expected_episode_count=4,
+            expected_total_clips=44,
+        )
+        metadata = metadata_by_split["train"]
+        self.assertEqual(metadata.action_placeholder_count, 4)
+        with h5py.File(source_path, "r", swmr=True) as source:
+            finite = np.asarray(source["action"][:], dtype=np.float32)
+        finite = finite[np.isfinite(finite).all(axis=1)]
+        np.testing.assert_allclose(metadata.action_mean.numpy(), finite.mean(axis=0))
+        np.testing.assert_allclose(metadata.action_std.numpy(), finite.std(axis=0))
+
+        terminal_clip_index = next(
+            index
+            for index, (_, local_start) in enumerate(datasets["train"].slices)
+            if local_start == 10
+        )
+        _, action, _, _ = datasets["train"][terminal_clip_index]
+        self.assertTrue(np.isfinite(action.numpy()).all())
+        np.testing.assert_array_equal(action[-1, -5:].numpy(), np.zeros(5, dtype=np.float32))
+
+    def test_nonterminal_nan_action_is_rejected(self):
+        source_path = self._write_episode_level_source(
+            "bad_interior_nan.h5",
+            action_dim=5,
+            proprio_columns=(("proprio", 4, 1.0),),
+            terminal_nan_actions=True,
+        )
+        with h5py.File(source_path, "r+") as source:
+            source["action"][1] = np.full(5, np.nan, dtype=np.float32)
+        with self.assertRaisesRegex(ValueError, "outside physical episode terminals"):
+            StableWMH5Metadata(
+                source_path,
+                normalize_action=True,
+                proprio_keys=("proprio",),
+            )
+
+    def test_partial_terminal_nan_action_is_rejected(self):
+        source_path = self._write_episode_level_source(
+            "bad_partial_terminal_nan.h5",
+            action_dim=5,
+            proprio_columns=(("proprio", 4, 1.0),),
+        )
+        with h5py.File(source_path, "r+") as source:
+            source["action"][29, 0] = np.nan
+        with self.assertRaisesRegex(ValueError, "partial non-finite"):
+            StableWMH5Metadata(
+                source_path,
+                normalize_action=True,
+                proprio_keys=("proprio",),
+            )
 
     def test_expected_dimensions_are_hard_stops(self):
         source_path = self._write_episode_level_source(

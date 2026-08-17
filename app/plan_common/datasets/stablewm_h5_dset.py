@@ -63,24 +63,94 @@ def _load_columns(source: h5py.File, keys: Sequence[str], rows) -> np.ndarray:
     return np.concatenate(values, axis=-1)
 
 
-def _streaming_stats(source: h5py.File, keys: Sequence[str], row_count: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _streaming_stats(
+    source: h5py.File,
+    keys: Sequence[str],
+    row_count: int,
+    *,
+    allowed_full_nan_rows: np.ndarray | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Compute population statistics while validating StableWM placeholders.
+
+    StableWorldModel records the reset observation and then left-aligns actions.
+    Consequently, the final observation of an episode has no outgoing action and
+    its complete action row is an intentional NaN placeholder.  No other
+    non-finite values are valid.  Callers may pass the physical terminal rows to
+    preserve that native convention without hiding malformed interior data.
+    """
+
+    allowed_full_nan_rows = (
+        np.empty(0, dtype=np.int64)
+        if allowed_full_nan_rows is None
+        else np.asarray(allowed_full_nan_rows, dtype=np.int64).reshape(-1)
+    )
+    if allowed_full_nan_rows.size and (
+        np.any(allowed_full_nan_rows < 0)
+        or np.any(allowed_full_nan_rows >= int(row_count))
+        or np.any(allowed_full_nan_rows[1:] <= allowed_full_nan_rows[:-1])
+    ):
+        raise ValueError("allowed full-NaN rows must be sorted unique in-range indices")
+
     total = None
     total_square = None
-    count = 0
+    finite_count = 0
+    rows_seen = 0
+    placeholder_count = 0
     for start in range(0, int(row_count), 65536):
         stop = min(int(row_count), start + 65536)
         value = _load_columns(source, keys, slice(start, stop)).astype(np.float64)
-        chunk_sum = value.sum(axis=0)
-        chunk_square = np.square(value).sum(axis=0)
-        total = chunk_sum if total is None else total + chunk_sum
-        total_square = chunk_square if total_square is None else total_square + chunk_square
-        count += len(value)
-    if count != int(row_count) or total is None or not np.isfinite(total).all():
+        finite_rows = np.isfinite(value).all(axis=1)
+        if not finite_rows.all():
+            invalid_local = np.flatnonzero(~finite_rows)
+            invalid_global = invalid_local + start
+            invalid_values = value[invalid_local]
+            if not np.isnan(invalid_values).all():
+                raise ValueError(
+                    f"non-terminal or partial non-finite values for columns {tuple(keys)}"
+                )
+            allowed_positions = np.searchsorted(
+                allowed_full_nan_rows,
+                invalid_global,
+            )
+            allowed = allowed_positions < len(allowed_full_nan_rows)
+            if allowed.any():
+                matched = np.zeros_like(allowed)
+                matched[allowed] = (
+                    allowed_full_nan_rows[allowed_positions[allowed]]
+                    == invalid_global[allowed]
+                )
+                allowed = matched
+            if not allowed.all():
+                raise ValueError(
+                    f"full-NaN values outside physical episode terminals for columns {tuple(keys)}"
+                )
+            placeholder_count += len(invalid_global)
+
+        finite_value = value[finite_rows]
+        if len(finite_value):
+            chunk_sum = finite_value.sum(axis=0)
+            chunk_square = np.square(finite_value).sum(axis=0)
+            total = chunk_sum if total is None else total + chunk_sum
+            total_square = chunk_square if total_square is None else total_square + chunk_square
+            finite_count += len(finite_value)
+        rows_seen += len(value)
+    if (
+        rows_seen != int(row_count)
+        or finite_count < 1
+        or total is None
+        or total_square is None
+        or not np.isfinite(total).all()
+        or not np.isfinite(total_square).all()
+    ):
         raise ValueError(f"non-finite or incomplete statistics for columns {tuple(keys)}")
-    mean = total / count
-    variance = np.maximum(total_square / count - np.square(mean), 0.0)
+    mean = total / finite_count
+    variance = np.maximum(total_square / finite_count - np.square(mean), 0.0)
     std = np.maximum(np.sqrt(variance), 1.0e-6)
-    return torch.from_numpy(mean.astype(np.float32)), torch.from_numpy(std.astype(np.float32))
+    return (
+        torch.from_numpy(mean.astype(np.float32)),
+        torch.from_numpy(std.astype(np.float32)),
+        placeholder_count,
+    )
 
 
 class StableWMH5Metadata:
@@ -176,10 +246,18 @@ class StableWMH5Metadata:
                 raise ValueError(f"StableWM proprio_dim={self.proprio_dim}, expected {expected_proprio_dim}")
 
             if normalize_action:
-                self.action_mean, self.action_std = _streaming_stats(
-                    source, ("action",), row_count
+                terminal_rows = episode_ends - 1
+                (
+                    self.action_mean,
+                    self.action_std,
+                    self.action_placeholder_count,
+                ) = _streaming_stats(
+                    source,
+                    ("action",),
+                    row_count,
+                    allowed_full_nan_rows=terminal_rows,
                 )
-                self.proprio_mean, self.proprio_std = _streaming_stats(
+                self.proprio_mean, self.proprio_std, _ = _streaming_stats(
                     source, self.proprio_keys, row_count
                 )
 
@@ -188,6 +266,7 @@ class StableWMH5Metadata:
         if not normalize_action:
             self.action_mean = torch.zeros(self.action_dim)
             self.action_std = torch.ones(self.action_dim)
+            self.action_placeholder_count = 0
             self.proprio_mean = torch.zeros(self.proprio_dim)
             self.proprio_std = torch.ones(self.proprio_dim)
         self.state_mean = self.proprio_mean.clone()
@@ -308,6 +387,9 @@ class StableWMH5SlicedDataset(Dataset):
         proprio = (proprio - self.metadata.proprio_mean) / self.metadata.proprio_std
         action = torch.from_numpy(np.asarray(source["action"][action_rows], dtype=np.float32))
         action = (action - self.metadata.action_mean) / self.metadata.action_std
+        # Match native LeWM: terminal action NaNs are normalized first, then
+        # replaced by the neutral value in normalized action space.
+        action = torch.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
         action = action.reshape(self.num_frames, -1)
         state = proprio.clone()
         reward = torch.zeros(self.num_frames, dtype=torch.float32)

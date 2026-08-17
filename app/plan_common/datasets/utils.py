@@ -107,6 +107,11 @@ def init_data(
             expected_total_clips=expected_total_clips,
         )
         dataset = datasets["train"]
+        logger.info(
+            "StableWM HDF5 normalization: "
+            f"action_terminal_placeholders={traj_dsets['train'].action_placeholder_count} "
+            f"rows={traj_dsets['train'].row_count} episodes={len(traj_dsets['train'])}"
+        )
         # DistributedSampler.set_epoch() supplies a new deterministic ordering
         # for every physical dataset pass.
         shuffle = True

@@ -88,12 +88,14 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
     def test_task_specific_lewm_step_budgets_use_effective_batch_128(self):
         expected = {
             "pusht": {
+                "version": 6,
                 "steps": 111464,
                 "steps_per_pass": 13923,
                 "driver_epochs": 9,
                 "passes": 8,
             },
             "cube": {
+                "version": 7,
                 "steps": 51184,
                 "steps_per_pass": 12796,
                 "driver_epochs": 4,
@@ -127,7 +129,14 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
                     f"step{expected[task]['steps']}",
                     spec["pi_run"],
                 )
-                self.assertIn("_v6_", spec["pi_run"])
+                self.assertEqual(
+                    spec["experiment_version"],
+                    expected[task]["version"],
+                )
+                self.assertIn(
+                    f"_v{expected[task]['version']}_",
+                    spec["pi_run"],
+                )
                 full_passes, tail_steps = divmod(
                     expected[task]["steps"],
                     expected[task]["steps_per_pass"],

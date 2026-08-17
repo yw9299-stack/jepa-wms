@@ -209,6 +209,7 @@ def main() -> int:
             "rows": metadata.row_count,
             "episodes": len(metadata),
             "action_dim": metadata.action_dim,
+            "action_terminal_placeholders": metadata.action_placeholder_count,
             "proprio_dim": metadata.proprio_dim,
             "proprio_keys": list(metadata.proprio_keys),
         },

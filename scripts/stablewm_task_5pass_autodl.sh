@@ -64,8 +64,8 @@ else
   SIDECAR="$PI_LTC_CUBE_SIDECAR"
   EXPECTED_SOURCE_BYTES=101942558720
   EXPECTED_SIDECAR_BYTES=1282198884
-  PI_RUN="cube_jepa_wm_pi_ltc_step51184_v6_seed3072"
-  VANILLA_RUN="cube_jepa_wm_vanilla_step51184_v6_seed3072"
+  PI_RUN="cube_jepa_wm_pi_ltc_step51184_v7_seed3072"
+  VANILLA_RUN="cube_jepa_wm_vanilla_step51184_v7_seed3072"
   OPTIMIZER_STEP_BUDGET=51184
   LEWM_REFERENCE_PASSES=4
   DRIVER_EPOCHS=4

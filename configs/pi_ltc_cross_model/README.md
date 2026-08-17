@@ -176,3 +176,17 @@ preflight/model smoke/LEWM smoke, and starts the requested arm. Dataset schema,
 episode boundaries, dimensions, and clip counts are still checked naturally
 during training initialization; action/proprio statistics must still be read
 because they are required for normalization.
+
+The native StableWorldModel recorder stores the final observation of every
+episode with a full-NaN action row because that state has no outgoing action.
+The adapter follows the original LeWM convention exactly: normalization
+statistics exclude those terminal rows, and a terminal placeholder encountered
+in the final valid clip becomes zero in normalized action space.  Full-NaN rows
+at non-terminal positions, partial-NaN rows, and infinities remain hard errors;
+the compatibility path therefore does not conceal damaged interior data.  The
+terminal clips remain part of the canonical clip count and do not change the
+PushT/Cube pass definitions.
+
+Cube runs with this terminal-placeholder adapter are versioned as `v7`; the
+rejected pre-adapter `v6` directory is retained as immutable diagnostic history.
+PushT remains on `v6` because its accepted runs and action data are unchanged.

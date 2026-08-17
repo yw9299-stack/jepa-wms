@@ -19,6 +19,7 @@ BASE_CONFIG = Path("configs/pi_ltc_cross_model/pointmaze_jepa_wm_pi_ltc_5pass.ya
 
 TASKS = {
     "pusht": {
+        "experiment_version": 6,
         "pi_run": "pusht_jepa_wm_pi_ltc_step111464_v6_seed3072",
         "vanilla_run": "pusht_jepa_wm_vanilla_step111464_v6_seed3072",
         "lewm_reference": "pusht_ltc_planner_identified_global_clean8p",
@@ -40,8 +41,9 @@ TASKS = {
         "sidecar_config_sha256": "35b55bbd2cdfde01ae133fe86254dc720116885c69e31165bf3abdb08fc5659b",
     },
     "cube": {
-        "pi_run": "cube_jepa_wm_pi_ltc_step51184_v6_seed3072",
-        "vanilla_run": "cube_jepa_wm_vanilla_step51184_v6_seed3072",
+        "experiment_version": 7,
+        "pi_run": "cube_jepa_wm_pi_ltc_step51184_v7_seed3072",
+        "vanilla_run": "cube_jepa_wm_vanilla_step51184_v7_seed3072",
         "lewm_reference": "cube_ltc_planner_identified_global_step51184_clean4p",
         "lewm_reference_passes": 4,
         "optimizer_step_budget": 51184,
@@ -216,7 +218,10 @@ def main() -> int:
     spec = TASKS[args.task]
     manifest = {
         "schema_version": 2,
-        "protocol": f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_lewm_stepmatched_v6",
+        "protocol": (
+            f"{args.task}_jepa_wm_pi_ltc_vs_vanilla_lewm_stepmatched_"
+            f"v{spec['experiment_version']}"
+        ),
         "repository_commit": commit,
         "repository_tracked_dirty": dirty,
         "content_hash_mode": os.environ.get("PI_LTC_CONTENT_HASH_MODE", "sha256"),
