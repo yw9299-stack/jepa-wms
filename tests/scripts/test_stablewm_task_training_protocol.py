@@ -169,6 +169,9 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
         checkpoint_utils = Path("app/vjepa_wm/utils.py").read_text(
             encoding="utf-8"
         )
+        dino_encoder = Path("app/plan_common/models/dino.py").read_text(
+            encoding="utf-8"
+        )
         summary = Path("scripts/summarize_stablewm_task_multiseed.py").read_text()
         self.assertIn("OPTIMIZER_STEP_BUDGET=111464", launcher)
         self.assertIn("OPTIMIZER_STEP_BUDGET=51184", launcher)
@@ -197,6 +200,12 @@ class TestStableWmTaskTrainingProtocol(unittest.TestCase):
         self.assertIn("total_optimizer_steps", checkpoint_sweeper)
         self.assertIn("PI_LTC_STOP_AFTER_COMPLETE_PASSES=0", checkpoint_sweeper)
         self.assertIn("8.0", checkpoint_sweeper)
+        self.assertIn("[offline DINOv2]", checkpoint_sweeper)
+        self.assertIn("facebookresearch_dinov2_main", checkpoint_sweeper)
+        self.assertIn("JEPAWM_DINOV2_REPO", dino_encoder)
+        self.assertIn("facebookresearch_dinov2_main", dino_encoder)
+        self.assertIn('source="local"', dino_encoder)
+        self.assertIn("facebookresearch/dinov2:main", dino_encoder)
         self.assertIn("vanilla_stepmatched", launcher)
         self.assertIn("vanilla_stepmatched", evaluator)
         self.assertIn("planner_validation_history.json", evaluator)

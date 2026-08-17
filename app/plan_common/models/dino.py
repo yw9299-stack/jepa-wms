@@ -3,6 +3,7 @@
 # Licensed under the MIT License
 import os
 import warnings
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -13,12 +14,44 @@ warnings.filterwarnings("ignore", message="xFormers is not available")
 torch.hub._validate_not_a_forked_repo = lambda a, b, c: True
 
 
+def _load_dinov2_from_cache_or_github(name):
+    """Use an existing Torch Hub checkout without probing GitHub first."""
+
+    explicit_repo = os.environ.get("JEPAWM_DINOV2_REPO")
+    if explicit_repo:
+        local_repo = Path(explicit_repo).expanduser().resolve()
+        if not local_repo.is_dir() or not (local_repo / "hubconf.py").is_file():
+            raise FileNotFoundError(
+                "JEPAWM_DINOV2_REPO is not a Torch Hub repository: "
+                f"{local_repo}"
+            )
+        return torch.hub.load(str(local_repo), name, source="local")
+
+    hub_dir = Path(torch.hub.get_dir())
+    for cache_name in (
+        "facebookresearch_dinov2_main",
+        "facebookresearch_dinov2_master",
+    ):
+        local_repo = hub_dir / cache_name
+        if local_repo.is_dir() and (local_repo / "hubconf.py").is_file():
+            return torch.hub.load(str(local_repo), name, source="local")
+
+    # Pinning the ref avoids Torch Hub's extra network request that probes
+    # whether the repository's default branch is ``main`` or ``master``.
+    return torch.hub.load(
+        "facebookresearch/dinov2:main",
+        name,
+        trust_repo=True,
+        skip_validation=True,
+    )
+
+
 class DinoEncoder(nn.Module):
     def __init__(self, name, feature_key, causal_enc=False):
         super().__init__()
         self.name = name
         if self.name.startswith("dinov2"):
-            self.base_model = torch.hub.load("facebookresearch/dinov2", name)
+            self.base_model = _load_dinov2_from_cache_or_github(name)
         elif self.name.startswith("dinov3"):
             pretrained_ckpt_root = os.environ.get("JEPAWM_OSSCKPT")
             dinov3_path = os.path.join(os.environ.get("JEPAWM_HOME", os.path.expanduser("~")), "dinov3")

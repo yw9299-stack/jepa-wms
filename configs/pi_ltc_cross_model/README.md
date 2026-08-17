@@ -105,7 +105,10 @@ W&B is disabled, zero training microbatches and optimizer steps are consumed,
 and the immutable result is written to
 `extended_scale_sweep_<commit>/planner_scale_sweep_only.json`.  This artifact
 is diagnostic only and cannot make a rejected canary eligible for formal
-training.
+training.  DINOv2 initialization first reuses the existing Torch Hub checkout
+(`facebookresearch_dinov2_main`) or an explicit `JEPAWM_DINOV2_REPO`; only a
+machine without either local checkout falls back to the pinned GitHub `main`
+revision.
 
 The first v5 PushT canary was rejected by that gate and remains an immutable
 diagnostic artifact.  The diagnostic-checkpoint/sweep revision therefore uses

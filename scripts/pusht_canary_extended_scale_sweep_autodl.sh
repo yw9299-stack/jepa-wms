@@ -29,6 +29,21 @@ git diff --cached --quiet || fail "JEPA index is dirty"
 test -f "$CANARY_SUMMARY" || fail "missing canary summary: $CANARY_SUMMARY"
 test -f "$CANARY_CONFIG" || fail "missing immutable canary config: $CANARY_CONFIG"
 
+if [ -z "${JEPAWM_DINOV2_REPO:-}" ]; then
+  TORCH_HUB_DIR="$(python -c 'import torch; print(torch.hub.get_dir())')"
+  for candidate in \
+    "$TORCH_HUB_DIR/facebookresearch_dinov2_main" \
+    "$TORCH_HUB_DIR/facebookresearch_dinov2_master"; do
+    if test -f "$candidate/hubconf.py"; then
+      export JEPAWM_DINOV2_REPO="$candidate"
+      break
+    fi
+  done
+fi
+test -f "${JEPAWM_DINOV2_REPO:-}/hubconf.py" || \
+  fail "missing cached DINOv2 Torch Hub checkout; set JEPAWM_DINOV2_REPO explicitly"
+echo "[offline DINOv2] repo=$JEPAWM_DINOV2_REPO"
+
 mapfile -t CHECKPOINT_AUDIT < <(
   python - "$CANARY_SUMMARY" "$CANARY_TRAINING_COMMIT" <<'PY'
 import hashlib

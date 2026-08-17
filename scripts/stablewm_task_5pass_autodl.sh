@@ -257,6 +257,7 @@ python -m unittest \
   tests.models.test_planner_identified_scale \
   tests.models.test_planner_landscape_loss \
   tests.datasets.test_stablewm_pi_ltc_h5 \
+  tests.scripts.test_dino_hub_loading \
   tests.scripts.test_stablewm_task_training_protocol \
   tests.scripts.test_stablewm_task_summary
 
