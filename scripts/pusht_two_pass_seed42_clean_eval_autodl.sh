@@ -35,10 +35,10 @@ PI_DIR="$JEPAWM_LOGS/pi_ltc_cross_model/$PI_RUN"
 VANILLA_DIR="$JEPAWM_LOGS/pi_ltc_cross_model/$VANILLA_RUN"
 PI_CONFIG="$PI_DIR/pi_training_config.yaml"
 VANILLA_CONFIG="$VANILLA_DIR/vanilla_training_config.yaml"
-PI_CHECKPOINT="$PI_DIR/jepa-e0.pth.tar"
-VANILLA_CHECKPOINT="$VANILLA_DIR/jepa-e0.pth.tar"
-RELAY_SUMMARY="$JEPAWM_LOGS/pi_ltc_cross_model/pusht_one_pass_relay/relay_summary.json"
-OUTPUT_ROOT="$JEPAWM_LOGS/pi_ltc_cross_model/pusht_onepass_seed42_clean_v1"
+PI_CHECKPOINT="$PI_DIR/jepa-e1.pth.tar"
+VANILLA_CHECKPOINT="$VANILLA_DIR/jepa-e1.pth.tar"
+RELAY_SUMMARY="$JEPAWM_LOGS/pi_ltc_cross_model/pusht_second_pass_relay/relay_summary.json"
+OUTPUT_ROOT="$JEPAWM_LOGS/pi_ltc_cross_model/pusht_twopass_seed42_clean_v1"
 PREFLIGHT_AUDIT="$OUTPUT_ROOT/preflight.json"
 SUMMARY="$OUTPUT_ROOT/pusht/seed42/pi_vs_vanilla_summary.json"
 
@@ -55,7 +55,7 @@ python scripts/preflight_pusht_one_pass_seed42_eval.py \
   --source-h5 "$SOURCE" \
   --sidecar-h5 "$SIDECAR" \
   --output "$PREFLIGHT_AUDIT" \
-  --expected-completed-passes 1
+  --expected-completed-passes 2
 
 mapfile -t PROVENANCE < <(python - "$PREFLIGHT_AUDIT" <<'PY'
 import json
@@ -80,7 +80,7 @@ run_arm() {
     --preflight-audit "$PREFLIGHT_AUDIT" \
     --training-config "$config" \
     --checkpoint-dir "$directory" \
-    --checkpoint jepa-e0.pth.tar \
+    --checkpoint jepa-e1.pth.tar \
     --owner "$owner" \
     --arm "$arm" \
     --output-root "$OUTPUT_ROOT" \
@@ -90,14 +90,14 @@ run_arm() {
     --expected-commit "$EXPECTED_EVALUATOR_COMMIT" \
     --expected-training-commit "$EXPECTED_TRAINING_COMMIT" \
     --expected-lewm-commit "$EXPECTED_LEWM_COMMIT" \
-    --expected-completed-passes 1 \
+    --expected-completed-passes 2 \
     --device cuda \
     --reuse-complete
 }
 
-echo "[seed42 clean] evaluating PI-LTC learned checkpoint"
+echo "[seed42 clean pass-2] evaluating PI-LTC learned checkpoint"
 run_arm pi learned "$PI_CONFIG" "$PI_DIR"
-echo "[seed42 clean] evaluating matched vanilla checkpoint"
+echo "[seed42 clean pass-2] evaluating matched vanilla checkpoint"
 run_arm vanilla vanilla_stepmatched "$VANILLA_CONFIG" "$VANILLA_DIR"
 
 python scripts/summarize_stablewm_task_seed_pair.py \
@@ -106,6 +106,6 @@ python scripts/summarize_stablewm_task_seed_pair.py \
   --eval-seed 42 \
   --output "$SUMMARY" \
   --bootstrap-draws 10000 \
-  --bootstrap-seed 20260816
+  --bootstrap-seed 20260817
 
-echo "[seed42 clean complete] summary=$SUMMARY"
+echo "[seed42 clean pass-2 complete] summary=$SUMMARY"

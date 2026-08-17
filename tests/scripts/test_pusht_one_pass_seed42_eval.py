@@ -136,6 +136,29 @@ def test_launcher_runs_only_two_clean_seed42_arms():
     assert "jepa-e0.pth.tar" in text
 
 
+def test_two_pass_launcher_selects_atomic_pass_two_pair():
+    text = Path("scripts/pusht_two_pass_seed42_clean_eval_autodl.sh").read_text(encoding="utf-8")
+    assert "pusht_second_pass_relay/relay_summary.json" in text
+    assert "pusht_twopass_seed42_clean_v1" in text
+    assert "--eval-seed 42" in text
+    assert "--episodes 50" in text
+    assert "--expected-completed-passes 2" in text
+    assert "run_arm pi learned" in text
+    assert "run_arm vanilla vanilla_stepmatched" in text
+    assert "run_arm pi identity" not in text
+    assert "fixed06" not in text
+    assert "fixed04" not in text
+    assert "jepa-e1.pth.tar" in text
+
+
+def test_preflight_accepts_only_audited_pass_boundaries():
+    text = Path("scripts/preflight_pusht_one_pass_seed42_eval.py").read_text(encoding="utf-8")
+    assert 'choices=(1, 2)' in text
+    assert '1: "PUSHT_MATCHED_ONE_PASS_COMPLETE"' in text
+    assert '2: "PUSHT_MATCHED_TWO_PASS_COMPLETE"' in text
+    assert 'expected_completed_passes=expected_completed_passes' in text
+
+
 def test_evaluator_separates_training_and_evaluation_commits():
     text = Path("scripts/eval_stablewm_task_protocol.py").read_text(encoding="utf-8")
     assert 'parser.add_argument("--expected-training-commit")' in text

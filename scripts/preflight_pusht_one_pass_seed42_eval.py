@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a no-dataset-scan audit for the matched PushT pass-1 checkpoints."""
+"""Build a no-dataset-scan audit for matched PushT pass-boundary checkpoints."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ def checkpoint_audit(
     expected_sha256: str,
     source_h5: Path,
     sidecar_h5: Path,
+    expected_completed_passes: int,
 ) -> dict:
     actual_sha256 = sha256(path)
     require(actual_sha256 == expected_sha256, f"{owner} checkpoint SHA-256 differs")
@@ -50,7 +51,7 @@ def checkpoint_audit(
     expected_schedule = expected_checkpoint_schedule(
         optimizer_steps_per_pass=OPTIMIZER_STEPS_PER_PASS,
         configured_optimizer_step_budget=CONFIGURED_OPTIMIZER_HORIZON,
-        expected_completed_passes=1,
+        expected_completed_passes=expected_completed_passes,
     )
     expected_fields = {
         "optimizer_steps_per_epoch": OPTIMIZER_STEPS_PER_PASS,
@@ -114,22 +115,38 @@ def main() -> int:
     parser.add_argument("--source-h5", type=Path, required=True)
     parser.add_argument("--sidecar-h5", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expected-completed-passes", type=int, choices=(1, 2), required=True)
     args = parser.parse_args()
+
+    completed_passes = int(args.expected_completed_passes)
+    expected_relay_status = {
+        1: "PUSHT_MATCHED_ONE_PASS_COMPLETE",
+        2: "PUSHT_MATCHED_TWO_PASS_COMPLETE",
+    }[completed_passes]
+    expected_optimizer_steps = completed_passes * OPTIMIZER_STEPS_PER_PASS
+    expected_microbatches = completed_passes * MICROBATCHES_PER_PASS
+    pass_label = {1: "one-pass", 2: "two-pass"}[completed_passes]
+    protocol = {
+        1: "pusht_jepa_wm_matched_one_pass_seed42_clean_preflight_v1",
+        2: "pusht_jepa_wm_matched_two_pass_seed42_clean_preflight_v1",
+    }[completed_passes]
 
     paths = {name: value.resolve() for name, value in vars(args).items() if isinstance(value, Path)}
     for name, path in paths.items():
         if name != "output" and not path.is_file():
             raise SystemExit(f"[STOP] missing {name}: {path}")
     relay = json.loads(paths["relay_summary"].read_text(encoding="utf-8"))
-    require(relay.get("status") == "PUSHT_MATCHED_ONE_PASS_COMPLETE", "relay summary is incomplete")
-    require(relay.get("optimizer_steps_per_arm") == OPTIMIZER_STEPS_PER_PASS, "relay optimizer steps differ")
-    require(relay.get("microbatches_per_arm") == MICROBATCHES_PER_PASS, "relay microbatches differ")
+    require(relay.get("status") == expected_relay_status, "relay summary is incomplete")
+    require(relay.get("optimizer_steps_per_arm") == expected_optimizer_steps, "relay optimizer steps differ")
+    require(relay.get("microbatches_per_arm") == expected_microbatches, "relay microbatches differ")
     require(relay.get("gradient_accumulation_steps") == GRADIENT_ACCUMULATION, "relay accumulation differs")
     require(
         relay.get("configured_scheduler_horizon_optimizer_steps") == CONFIGURED_OPTIMIZER_HORIZON,
         "relay scheduler horizon differs",
     )
     require(relay.get("intentional_boundary_stop") is True, "relay boundary-stop marker is missing")
+    if completed_passes == 2:
+        require(relay.get("selected_completed_passes") == 2, "relay selected pass boundary differs")
 
     pi_config = yaml.safe_load(paths["pi_config"].read_text(encoding="utf-8"))
     vanilla_config = yaml.safe_load(paths["vanilla_config"].read_text(encoding="utf-8"))
@@ -164,6 +181,7 @@ def main() -> int:
         relay["pi"]["sha256"],
         paths["source_h5"],
         paths["sidecar_h5"],
+        completed_passes,
     )
     vanilla = checkpoint_audit(
         paths["vanilla_checkpoint"],
@@ -171,6 +189,7 @@ def main() -> int:
         relay["vanilla"]["sha256"],
         paths["source_h5"],
         paths["sidecar_h5"],
+        completed_passes,
     )
     require(relay["pi"]["checkpoint"] == str(paths["pi_checkpoint"]), "relay PI path differs")
     require(relay["vanilla"]["checkpoint"] == str(paths["vanilla_checkpoint"]), "relay vanilla path differs")
@@ -197,7 +216,7 @@ def main() -> int:
         "schema_version": 1,
         "status": "PASS",
         "task": "pusht",
-        "protocol": "pusht_jepa_wm_matched_one_pass_seed42_clean_preflight_v1",
+        "protocol": protocol,
         "repository_commit": pi["repository_commit"],
         "content_hash_mode": pi["content_hash_mode"],
         "source": {
@@ -217,9 +236,9 @@ def main() -> int:
         "split": {"optimizer_steps_per_pass": OPTIMIZER_STEPS_PER_PASS},
         "checkpoint_selection": {
             "policy": "native_complete_pass_boundary",
-            "completed_passes": 1,
-            "optimizer_steps": OPTIMIZER_STEPS_PER_PASS,
-            "microbatches": MICROBATCHES_PER_PASS,
+            "completed_passes": completed_passes,
+            "optimizer_steps": expected_optimizer_steps,
+            "microbatches": expected_microbatches,
             "configured_scheduler_horizon_optimizer_steps": CONFIGURED_OPTIMIZER_HORIZON,
         },
         "checkpoints": {"pi": pi, "vanilla": vanilla},
@@ -233,12 +252,12 @@ def main() -> int:
             output.read_text(encoding="utf-8") == payload,
             "existing preflight audit differs; preserve and inspect it",
         )
-        print(f"[reuse one-pass eval preflight PASS] {output}")
+        print(f"[reuse {pass_label} eval preflight PASS] {output}")
         return 0
     temporary = output.with_suffix(output.suffix + ".tmp")
     temporary.write_text(payload, encoding="utf-8")
     os.replace(temporary, output)
-    print(f"[one-pass eval preflight PASS] {output}")
+    print(f"[{pass_label} eval preflight PASS] {output}")
     return 0
 
 
